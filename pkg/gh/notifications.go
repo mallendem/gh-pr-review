@@ -7,13 +7,14 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"github.com/mallendem/gh-pr-review/pkg/utils"
 	"io"
 	"net/http"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/mallendem/gh-pr-review/pkg/utils"
 
 	"github.com/google/go-github/v72/github"
 	"golang.org/x/sync/errgroup"
@@ -310,30 +311,13 @@ func (g *GhClient) ApprovePr(pr *github.PullRequest) error {
 	number := pr.GetNumber()
 
 	// 1) Try to update the branch (rebase) using the REST endpoint
-	updateURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/pulls/%d/update-branch", owner, repo, number)
-	req, err := http.NewRequest("POST", updateURL, nil)
-	if err != nil {
-		// Non-fatal: return error
-		return fmt.Errorf("failed to create update-branch request: %w", err)
-	}
-	req.Header.Set("Accept", "application/vnd.github+json")
-
-	// This endpoint requires authentication
-	req.Header.Set("Authorization", "Bearer "+g.t)
-	resp, err := g.c.Client().Do(req)
-	if err != nil {
-		// Log and continue to approval step
-		fmt.Printf("warning: update-branch request failed for %s: %v\n", pr.GetHTMLURL(), err)
-	} else {
-		// drain and close
-		_, _ = io.Copy(io.Discard, resp.Body)
-		_ = resp.Body.Close()
-		// we can have a valid 200OK response witha 404 Not Found status in the body
-		if resp.StatusCode >= 200 && resp.StatusCode <= 299 {
-			fmt.Printf("updated branch for PR %s (status %d)\n", pr.GetHTMLURL(), resp.StatusCode)
-		} else {
-			fmt.Printf("warning: update-branch returned status %d for PR %s\n", resp.StatusCode, pr.GetHTMLURL())
-		}
+	// The idea here would be to detect if we need a rebase and then trigger it
+	if err := g.tryUpdateBranch(owner, repo, number, pr); err != nil {
+		// TODO: this doesn't work, no idea why rebasing via API is so broken,
+		// but we should detect if we _need_ to rebase first before trying, and
+		// if it fails, we should return errors properly.
+		fmt.Printf("warning: failed to update branch for PR %s: %v\n", pr.GetHTMLURL(), err)
+		//return err
 	}
 
 	// 2) Approve the PR (create a review with APPROVE)
@@ -343,61 +327,18 @@ func (g *GhClient) ApprovePr(pr *github.PullRequest) error {
 	}
 	_, _, revErr := g.c.PullRequests.CreateReview(context.Background(), owner, repo, number, review)
 	if revErr != nil {
-		fmt.Printf("warning: failed to create approval review for PR %s: %v\n", pr.GetHTMLURL(), revErr)
-	} else {
-		fmt.Printf("created approval review for PR %s\n", pr.GetHTMLURL())
+		return fmt.Errorf("failed to create approval for PR %s: %w", pr.GetHTMLURL(), revErr)
 	}
 
 	// 3) Enable auto-merge for the PR using GraphQL mutation
 	// Use the enablePullRequestAutoMerge mutation (requires PR node ID)
 	nodeID := pr.GetNodeID()
 	if nodeID == "" {
-		fmt.Printf("warning: PR %s missing node ID; cannot enable auto-merge\n", pr.GetHTMLURL())
+		return fmt.Errorf("PR %s has no node ID, cant enable auto-merge", pr.GetHTMLURL())
 	} else {
-		graphqlURL := "https://api.github.com/graphql"
-		mutation := `mutation EnableAutoMerge($pullId:ID!, $mergeMethod:PullRequestMergeMethod!) { enablePullRequestAutoMerge(input:{pullRequestId:$pullId, mergeMethod:$mergeMethod}) { pullRequest { id } } }`
-		vars := map[string]interface{}{
-			"pullId":      nodeID,
-			"mergeMethod": "SQUASH",
-		}
-		payload := map[string]interface{}{
-			"query":     mutation,
-			"variables": vars,
-		}
-		bodyBytes, _ := json.Marshal(payload)
-		reqGQL, err := http.NewRequest("POST", graphqlURL, bytes.NewReader(bodyBytes))
-		if err != nil {
-			fmt.Printf("warning: failed to create GraphQL request for PR %s: %v\n", pr.GetHTMLURL(), err)
-		} else {
-			reqGQL.Header.Set("Accept", "application/vnd.github+json")
-			reqGQL.Header.Set("Content-Type", "application/json")
-			reqGQL.Header.Set("Authorization", "Bearer "+g.t)
-			respGQL, err := g.c.Client().Do(reqGQL)
-			if err != nil {
-				fmt.Printf("warning: GraphQL request failed for PR %s: %v\n", pr.GetHTMLURL(), err)
-			} else {
-				defer func() { _ = respGQL.Body.Close() }()
-				body, _ := io.ReadAll(respGQL.Body)
-				if respGQL.StatusCode < 200 || respGQL.StatusCode > 299 {
-					fmt.Printf("warning: GraphQL enablePullRequestAutoMerge returned status %d for PR %s: %s\n", respGQL.StatusCode, pr.GetHTMLURL(), string(body))
-				} else {
-					// inspect response for GraphQL errors
-					var gqlResp struct {
-						Data   interface{}              `json:"data"`
-						Errors []map[string]interface{} `json:"errors"`
-					}
-					if err := json.Unmarshal(body, &gqlResp); err != nil {
-						fmt.Printf("warning: failed to decode GraphQL response for PR %s: %v\n", pr.GetHTMLURL(), err)
-					} else if len(gqlResp.Errors) > 0 {
-						fmt.Printf("warning: GraphQL returned errors for PR %s: %v\n", pr.GetHTMLURL(), gqlResp.Errors)
-					} else {
-						fmt.Printf("enabled auto-merge (GraphQL) for PR %s\n", pr.GetHTMLURL())
-					}
-				}
-			}
-		}
+		g.tryEnableAutoMerge(nodeID, pr)
 	}
-	//
+
 	//// After enabling auto-merge (or attempting to), attempt to merge the PR immediately via REST.
 	//// This uses the "Merge a pull request" endpoint: PUT /repos/{owner}/{repo}/pulls/{pull_number}/merge
 	//mergeURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/pulls/%d/merge", owner, repo, number)
@@ -427,4 +368,122 @@ func (g *GhClient) ApprovePr(pr *github.PullRequest) error {
 	//}
 
 	return nil
+}
+
+// tryUpdateBranch tries to update the branch (rebase) for the given PR via REST.
+// It returns an error only if building the HTTP request fails; other failures are
+// logged as warnings to preserve the original behavior.
+func (g *GhClient) tryUpdateBranch(owner, repo string, number int, pr *github.PullRequest) error {
+	updateURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/pulls/%d/update-branch", owner, repo, number)
+	req, err := http.NewRequest("POST", updateURL, nil)
+	if err != nil {
+		// Non-fatal: return error to match previous behavior where a request build failure
+		// caused an early return from ApprovePr.
+		return fmt.Errorf("failed to create update-branch request: %w", err)
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+
+	// This endpoint requires authentication
+	req.Header.Set("Authorization", "Bearer "+g.t)
+	resp, err := g.c.Client().Do(req)
+	if err != nil {
+		// Log and continue to approval step, this doesn't work yet
+		fmt.Printf("warning: update-branch request failed for %s: %v\n", pr.GetHTMLURL(), err)
+		return nil
+	}
+	defer func() {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+	}()
+	// we can have a valid 200OK response with a 404 Not Found status in the body
+	if resp.StatusCode >= 200 && resp.StatusCode <= 299 {
+		fmt.Printf("updated branch for PR %s (status %d)\n", pr.GetHTMLURL(), resp.StatusCode)
+	} else {
+		fmt.Printf("warning: update-branch returned status %d for PR %s\n", resp.StatusCode, pr.GetHTMLURL())
+	}
+	return nil
+}
+
+// tryEnableAutoMerge attempts to enable auto-merge for the given PR using GraphQL.
+// It logs warnings on failures but does not return an error so callers can continue.
+func (g *GhClient) tryEnableAutoMerge(nodeID string, pr *github.PullRequest) {
+	graphqlURL := "https://api.github.com/graphql"
+	mutation := `mutation EnableAutoMerge($pullId:ID!, $mergeMethod:PullRequestMergeMethod!) { enablePullRequestAutoMerge(input:{pullRequestId:$pullId, mergeMethod:$mergeMethod}) { pullRequest { id } } }`
+	vars := map[string]interface{}{
+		"pullId":      nodeID,
+		"mergeMethod": "SQUASH",
+	}
+	payload := map[string]interface{}{
+		"query":     mutation,
+		"variables": vars,
+	}
+	bodyBytes, _ := json.Marshal(payload)
+	reqGQL, err := http.NewRequest("POST", graphqlURL, bytes.NewReader(bodyBytes))
+	if err != nil {
+		fmt.Printf("warning: failed to create GraphQL request for PR %s: %v\n", pr.GetHTMLURL(), err)
+		return
+	}
+	reqGQL.Header.Set("Accept", "application/vnd.github+json")
+	reqGQL.Header.Set("Content-Type", "application/json")
+	reqGQL.Header.Set("Authorization", "Bearer "+g.t)
+	respGQL, err := g.c.Client().Do(reqGQL)
+	if err != nil {
+		fmt.Printf("warning: GraphQL request failed for PR %s: %v\n", pr.GetHTMLURL(), err)
+		return
+	}
+	defer func() { _ = respGQL.Body.Close() }()
+	body, _ := io.ReadAll(respGQL.Body)
+	if respGQL.StatusCode < 200 || respGQL.StatusCode > 299 {
+		fmt.Printf("warning: GraphQL enablePullRequestAutoMerge returned status %d for PR %s: %s\n", respGQL.StatusCode, pr.GetHTMLURL(), string(body))
+		return
+	}
+	// inspect response for GraphQL errors
+	var gqlResp struct {
+		Data   interface{}              `json:"data"`
+		Errors []map[string]interface{} `json:"errors"`
+	}
+	if err := json.Unmarshal(body, &gqlResp); err != nil {
+		fmt.Printf("warning: failed to decode GraphQL response for PR %s: %v\n", pr.GetHTMLURL(), err)
+		return
+	} else if len(gqlResp.Errors) > 0 {
+		fmt.Printf("warning: GraphQL returned errors for PR %s: %v\n", pr.GetHTMLURL(), gqlResp.Errors)
+		return
+	}
+	fmt.Printf("enabled auto-merge (GraphQL) for PR %s\n", pr.GetHTMLURL())
+}
+
+func (g *GhClient) GetPrComment(pr *github.PullRequest) (string, error) {
+	if pr == nil {
+		return "", fmt.Errorf("nil PR")
+	}
+
+	// Prefer the PR description/body if it's present
+	if body := strings.TrimSpace(pr.GetBody()); body != "" {
+		return cleanDependabotMessage(body), nil
+	}
+
+	// Fallback: fetch issue comments for the PR and return the most recent non-empty comment
+	base := pr.GetBase()
+	if base == nil || base.GetRepo() == nil || base.GetRepo().GetOwner() == nil {
+		return "", fmt.Errorf("unable to determine owner/repo for PR %s", pr.GetHTMLURL())
+	}
+	owner := base.GetRepo().GetOwner().GetLogin()
+	repo := base.GetRepo().GetName()
+	number := pr.GetNumber()
+
+	opt := &github.IssueListCommentsOptions{
+		ListOptions: github.ListOptions{PerPage: 100},
+	}
+	comments, _, err := g.c.Issues.ListComments(context.Background(), owner, repo, number, opt)
+	if err != nil {
+		return "", err
+	}
+	for i := len(comments) - 1; i >= 0; i-- {
+		if b := strings.TrimSpace(comments[i].GetBody()); b != "" {
+			return b, nil
+		}
+	}
+
+	// No comment found
+	return "", nil
 }
