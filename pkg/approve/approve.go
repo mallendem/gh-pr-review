@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/google/go-github/v72/github"
 	"github.com/mallendem/gh-pr-review/pkg/gh"
 )
 
@@ -25,11 +26,8 @@ func colorize(col, s string) string {
 }
 
 func ApprovePullRequest(users []string) error {
-
 	c := gh.NewGhClient()
-
 	c.PrintChangesPerUser(users)
-
 	return nil
 }
 
@@ -104,37 +102,11 @@ func ManualApproval(user string, propagate bool, dryRun bool) error {
 	}
 
 	// Collect hashes for the given user
-	hashesMap := map[string]struct{}{}
-	for _, u := range strings.Split(user, ",") {
-
-		if userMap, ok := userHashPrMap[u]; ok {
-			for h := range userMap {
-				hashesMap[h] = struct{}{}
-			}
-		} else {
-			// try case-insensitive match
-			for uname, userMap := range userHashPrMap {
-				if strings.EqualFold(uname, u) {
-					for h := range userMap {
-						hashesMap[h] = struct{}{}
-					}
-					break
-				}
-			}
-		}
-	}
-
-	if len(hashesMap) == 0 {
+	hashes := collectHashesForUsers(user, userHashPrMap)
+	if len(hashes) == 0 {
 		fmt.Printf("%s\n", colorize(cYellow, fmt.Sprintf("No hashes found for user %s", user)))
 		return nil
 	}
-
-	// Create sorted list for deterministic ordering
-	var hashes []string
-	for h := range hashesMap {
-		hashes = append(hashes, h)
-	}
-	sort.Strings(hashes)
 
 	approved := map[string]bool{}
 	declined := map[string]bool{}
@@ -145,26 +117,8 @@ func ManualApproval(user string, propagate bool, dryRun bool) error {
 	firstSeen := map[string]string{}
 	total := len(hashes)
 
-	// Build a deterministic list of unique PR keys (global progress across hashes)
-	prKeySet := map[string]struct{}{}
-	var uniquePrKeys []string
-	for _, h := range hashes {
-		if prs, ok := hashPrMap[h]; ok {
-			for _, pr := range prs {
-				k := pr.GetHTMLURL()
-				if _, seen := prKeySet[k]; !seen {
-					prKeySet[k] = struct{}{}
-					uniquePrKeys = append(uniquePrKeys, k)
-				}
-			}
-		}
-	}
-	// sort for deterministic order
-	sort.Strings(uniquePrKeys)
-	prIndexMap := map[string]int{}
-	for i, k := range uniquePrKeys {
-		prIndexMap[k] = i + 1
-	}
+	// Build deterministic unique PR list and index map
+	uniquePrKeys, prIndexMap := buildUniquePrKeys(hashes, hashPrMap)
 	totalPRs := len(uniquePrKeys)
 
 	for idx, h := range hashes {
@@ -188,70 +142,35 @@ func ManualApproval(user string, propagate bool, dryRun bool) error {
 			}
 		}
 
-		fmt.Printf("\n%s %s\n", colorize(cYellow, "Hash:"), colorize(cYellow, h))
-		if changes, ok := changeMap[h]; ok {
-			// Decide if this hash is entirely duplicates of previously seen, approved hashes
-			allDup := true
-			originals := map[string]struct{}{}
-			for _, line := range changes {
-				if first, seen := firstSeen[line]; seen {
-					// If the line was first seen under this same hash, it's not a duplicate-only hash
-					if first == h {
-						allDup = false
-						break
-					}
-					// If the original hash that first saw this line is not approved yet, can't auto-approve
-					if !approved[first] {
-						allDup = false
-						break
-					}
-					originals[first] = struct{}{}
-				} else {
-					allDup = false
-					break
-				}
+		// Display changes and PRs, and handle auto-approve for duplicate-only hashes
+		if allDup, originals := isAllDuplicateApproved(h, changeMap, firstSeen, approved); allDup {
+			approved[h] = true
+			var origs []string
+			for _, o := range originals {
+				origs = append(origs, o)
 			}
-			if allDup && len(originals) > 0 {
-				approved[h] = true
-				var origs []string
-				for o := range originals {
-					origs = append(origs, o)
-				}
-				sort.Strings(origs)
-				fmt.Printf("%s\n", fmt.Sprintf("All changes for hash %s are duplicates of %v and already approved — auto-approving.", h, origs))
-				continue
-			}
+			sort.Strings(origs)
+			fmt.Printf("%s\n", fmt.Sprintf("All changes for hash %s are duplicates of %v and already approved — auto-approving.", h, origs))
+			continue
+		}
 
-			// Print changes, marking duplicates and then record firstSeen for previously unseen lines
+		// Print changes and mark firstSeen
+		if changes, ok := changeMap[h]; ok {
 			fmt.Println("Changes:")
-			for _, line := range changes {
-				if first, seen := firstSeen[line]; seen {
-					fmt.Printf("  %s %s\n", colorize(cGreen, fmt.Sprintf("[duplicate of %s]", first)), colorize(cGreen, line))
-				} else {
-					fmt.Printf("  %s\n", colorize(cCyan, line))
-					firstSeen[line] = h
-				}
-			}
+			printChangesAndMarkFirstSeen(h, changes, firstSeen)
 		} else {
 			fmt.Println("No changes recorded for this hash.")
 		}
+
 		// Show associated PRs
 		prCount := 0
 		firstPrKey := ""
-		prs, ok := hashPrMap[h]
-		if ok {
-			prCount = len(prs)
-			fmt.Println("Associated PRs:")
-			for i, pr := range prs {
-				fmt.Printf("  %s %s\n", colorize(cYellow, fmt.Sprintf("[%d/%d]", i+1, prCount)), colorize(cYellow, pr.GetTitle()))
-				fmt.Printf("    %s\n", colorize(cYellow, pr.GetHTMLURL()))
-				if i == 0 {
-					firstPrKey = pr.GetHTMLURL()
-				}
-			}
-		} else {
+		// we only need the side-effect of printing inside showAssociatedPRs, no need to keep the return
+		_ = showAssociatedPRs(h, hashPrMap, &prCount, &firstPrKey)
+		if prCount == 0 {
 			fmt.Println("No PRs associated with this hash.")
 		}
+
 		// Determine progress index for PRs (global)
 		prProgressIndex := 1
 		if firstPrKey != "" {
@@ -259,71 +178,202 @@ func ManualApproval(user string, propagate bool, dryRun bool) error {
 				prProgressIndex = v
 			}
 		}
-		// Prompt with status: pr X/Y hash: i/M
-		for {
-			fmt.Print(colorize(cOrange, fmt.Sprintf("pr %d/%d hash: %d/%d approve this hash? (y/n/s/q) ", prProgressIndex, totalPRs, idx+1, total)))
-			input, _ := in.ReadString('\n')
-			input = strings.TrimSpace(strings.ToLower(input))
-			if input == "y" || input == "a" {
-				approved[h] = true
-				// if propagate is set, auto-approve linked hashes in the same PR(s)
-				if propagate {
-					autoApproveLinkedHashes(h, approved, declined, hashPrMap, prMap)
-				}
-				break
-			} else if input == "n" || input == "d" {
-				// Mark this hash declined and skip any PRs that include it.
-				declined[h] = true
 
-				// For each PR that references this hash, mark the PR skipped and mark all its hashes as declined.
-				autoDeclineLinkedHashes(h, declined, prSkipped, hashPrMap, prMap)
+		// Prompt the user for action and update approved/declined/prSkipped
+		promptActionForHash(h, idx, total, prProgressIndex, totalPRs, in, g, propagate, approved, declined, prSkipped, hashPrMap, prMap)
+	}
 
-				break
-			} else if input == "q" {
-				fmt.Println("Quitting manual approval early.")
-				os.Exit(0)
-			} else if input == "s" {
-				comment := ""
-				for _, pr := range prs {
-					c, _ := g.GetPrComment(pr)
-					if c != "" {
-						comment = comment + colorize(cCyan, "\n\n--------"+strings.Repeat("-", len("From PR "+pr.GetHTMLURL()))+"\n")
-						comment = comment + colorize(cCyan, "--- From PR "+pr.GetHTMLURL()+" ---\n")
-						comment = comment + colorize(cCyan, "--------"+strings.Repeat("-", len("From PR "+pr.GetHTMLURL()))+"\n\n")
-						comment = comment + colorize(cGreen, c)
+	// After prompting, process approvals for PRs
+	processApprovals(prMap, approved, declined, prSkipped, hashPrMap, g, dryRun)
+
+	return nil
+}
+
+// collectHashesForUsers normalizes the comma-separated user input and returns a
+// sorted list of unique hashes for those users (case-insensitive match against map keys).
+func collectHashesForUsers(user string, userHashPrMap gh.GhPrHashMap) []string {
+	hashesMap := map[string]struct{}{}
+	for _, u := range strings.Split(user, ",") {
+		if userMap, ok := userHashPrMap[u]; ok {
+			for h := range userMap {
+				hashesMap[h] = struct{}{}
+			}
+		} else {
+			for uname, userMap := range userHashPrMap {
+				if strings.EqualFold(uname, u) {
+					for h := range userMap {
+						hashesMap[h] = struct{}{}
 					}
+					break
 				}
-
-				if comment != "" {
-					fmt.Printf("%s\n", colorize(cGreen, "Review comment:"))
-					fmt.Printf("%s\n", comment)
-				} else {
-					fmt.Printf("%s\n", colorize(cYellow, "No review comment found for this hash."))
-				}
-			} else {
-				fmt.Println("Please enter y (approve), n (decline), s (show comment) or q (quit)")
 			}
 		}
 	}
+	var hashes []string
+	for h := range hashesMap {
+		hashes = append(hashes, h)
+	}
+	sort.Strings(hashes)
+	return hashes
+}
 
-	// For each PR in prMap, if all its hashes are approved, approve the PR
+// buildUniquePrKeys returns a sorted slice of unique PR keys and an index map (1-based)
+// that maps PR key to its index in the sorted list.
+func buildUniquePrKeys(hashes []string, hashPrMap gh.HashPrMap) ([]string, map[string]int) {
+	prKeySet := map[string]struct{}{}
+	var uniquePrKeys []string
+	for _, h := range hashes {
+		if prs, ok := hashPrMap[h]; ok {
+			for _, pr := range prs {
+				k := pr.GetHTMLURL()
+				if _, seen := prKeySet[k]; !seen {
+					prKeySet[k] = struct{}{}
+					uniquePrKeys = append(uniquePrKeys, k)
+				}
+			}
+		}
+	}
+	sort.Strings(uniquePrKeys)
+	prIndexMap := map[string]int{}
+	for i, k := range uniquePrKeys {
+		prIndexMap[k] = i + 1
+	}
+	return uniquePrKeys, prIndexMap
+}
+
+// isAllDuplicateApproved checks whether all change lines for hash `h` were first
+// seen under other hashes that have already been approved. It returns (true, list)
+// where the list contains the original hashes that covered the changes.
+func isAllDuplicateApproved(h string, changeMap gh.HashChangeMap, firstSeen map[string]string, approved map[string]bool) (bool, []string) {
+	changes, ok := changeMap[h]
+	if !ok {
+		return false, nil
+	}
+	allDup := true
+	originalsSet := map[string]struct{}{}
+	for _, line := range changes {
+		if first, seen := firstSeen[line]; seen {
+			if first == h {
+				allDup = false
+				break
+			}
+			if !approved[first] {
+				allDup = false
+				break
+			}
+			originalsSet[first] = struct{}{}
+		} else {
+			allDup = false
+			break
+		}
+	}
+	if !allDup || len(originalsSet) == 0 {
+		return false, nil
+	}
+	var originals []string
+	for o := range originalsSet {
+		originals = append(originals, o)
+	}
+	sort.Strings(originals)
+	return true, originals
+}
+
+// printChangesAndMarkFirstSeen prints change lines for `h`, marking duplicates and
+// recording firstSeen for lines not seen before.
+func printChangesAndMarkFirstSeen(h string, changes []string, firstSeen map[string]string) {
+	for _, line := range changes {
+		if first, seen := firstSeen[line]; seen {
+			fmt.Printf("  %s %s\n", colorize(cGreen, fmt.Sprintf("[duplicate of %s]", first)), colorize(cGreen, line))
+		} else {
+			fmt.Printf("  %s\n", colorize(cCyan, line))
+			firstSeen[line] = h
+		}
+	}
+}
+
+// showAssociatedPRs prints associated PRs for a given hash and returns the PR slice.
+// It also sets prCount and firstPrKey via pointers for callers to use.
+func showAssociatedPRs(h string, hashPrMap gh.HashPrMap, prCount *int, firstPrKey *string) []*github.PullRequest {
+	prs := []*github.PullRequest(nil)
+	if ps, ok := hashPrMap[h]; ok {
+		*prCount = len(ps)
+		fmt.Println("Associated PRs:")
+		for i, pr := range ps {
+			fmt.Printf("  %s %s\n", colorize(cYellow, fmt.Sprintf("[%d/%d]", i+1, *prCount)), colorize(cYellow, pr.GetTitle()))
+			fmt.Printf("    %s\n", colorize(cYellow, pr.GetHTMLURL()))
+			if i == 0 {
+				*firstPrKey = pr.GetHTMLURL()
+			}
+			prs = append(prs, pr)
+		}
+	}
+	return prs
+}
+
+// promptActionForHash prompts the user for an action on a hash and updates maps in-place.
+func promptActionForHash(h string, idx, total, prProgressIndex, totalPRs int, in *bufio.Reader, g *gh.GhClient, propagate bool, approved, declined, prSkipped map[string]bool, hashPrMap gh.HashPrMap, prMap map[string][]string) {
+	for {
+		fmt.Print(colorize(cOrange, fmt.Sprintf("pr %d/%d hash: %d/%d approve this hash? (y/n/s/q) ", prProgressIndex, totalPRs, idx+1, total)))
+		input, _ := in.ReadString('\n')
+		input = strings.TrimSpace(strings.ToLower(input))
+		if input == "y" || input == "a" {
+			approved[h] = true
+			if propagate {
+				autoApproveLinkedHashes(h, approved, declined, hashPrMap, prMap)
+			}
+			break
+		} else if input == "n" || input == "d" {
+			declined[h] = true
+			autoDeclineLinkedHashes(h, declined, prSkipped, hashPrMap, prMap)
+			break
+		} else if input == "q" {
+			fmt.Println("Quitting manual approval early.")
+			os.Exit(0)
+		} else if input == "s" {
+			comment := ""
+			prs := hashPrMap[h]
+			for _, pr := range prs {
+				c, err := g.GetPrComment(pr)
+				if err != nil {
+					fmt.Printf("%s\n", colorize(cRed, fmt.Sprintf("Error fetching comment for PR %s: %v", pr.GetHTMLURL(), err)))
+					continue
+				}
+				if c != "" {
+					comment = comment + colorize(cCyan, "\n\n--------"+strings.Repeat("-", len("From PR "+pr.GetHTMLURL()))+"\n")
+					comment = comment + colorize(cCyan, "--- From PR "+pr.GetHTMLURL()+" ---\n")
+					comment = comment + colorize(cCyan, "--------"+strings.Repeat("-", len("From PR "+pr.GetHTMLURL()))+"\n\n")
+					comment = comment + colorize(cGreen, c)
+				}
+			}
+
+			if comment != "" {
+				fmt.Printf("%s\n", colorize(cGreen, "Review comment:"))
+				fmt.Printf("%s\n", comment)
+			} else {
+				fmt.Printf("%s\n", colorize(cYellow, "No review comment found for this hash."))
+			}
+		} else {
+			fmt.Println("Please enter y (approve), n (decline), s (show comment) or q (quit)")
+		}
+	}
+}
+
+// processApprovals walks prMap and approves PRs where all hashes are approved.
+func processApprovals(prMap map[string][]string, approved, declined, prSkipped map[string]bool, hashPrMap gh.HashPrMap, g *gh.GhClient, dryRun bool) {
 	for prKey, phashes := range prMap {
 		if len(phashes) == 0 {
 			continue
 		}
-		// Skip PRs explicitly marked as skipped
 		if prSkipped[prKey] {
 			fmt.Printf("%s\n", colorize(cYellow, fmt.Sprintf("Not approving PR %s (skipped due to a declined hash)", prKey)))
 			continue
 		}
 		allApproved := true
 		for _, ph := range phashes {
-			// If the PR contains any hash that was explicitly declined, do not approve
 			if declined[ph] {
 				allApproved = false
 				break
 			}
-			// If the PR contains hashes that were not in our approval set, consider them unapproved
 			if len(approved) > 0 {
 				if !approved[ph] {
 					allApproved = false
@@ -332,12 +382,10 @@ func ManualApproval(user string, propagate bool, dryRun bool) error {
 			}
 		}
 		if allApproved {
-			// Search for a PR matching prKey in hashPrMap and approve it
 			found := false
 			for _, prs := range hashPrMap {
 				for _, pr := range prs {
 					if pr.GetHTMLURL() == prKey {
-						// call ApprovePR (which delegates to API) or print action in dry-run
 						if dryRun {
 							fmt.Printf("%s\n", colorize(cYellow, fmt.Sprintf("[dry-run] Would approve PR %s", prKey)))
 						} else {
@@ -360,8 +408,6 @@ func ManualApproval(user string, propagate bool, dryRun bool) error {
 			}
 		}
 	}
-
-	return nil
 }
 
 // autoApproveLinkedHashes auto-approves hashes that are linked in the same PR(s) as
