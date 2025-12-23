@@ -1,7 +1,7 @@
 package cmd
 
 import (
-	"pr-approver/pkg/approve"
+	"github.com/mallendem/gh-pr-review/pkg/approve"
 
 	"github.com/spf13/cobra"
 )

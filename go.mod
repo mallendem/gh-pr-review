@@ -1,4 +1,4 @@
-module pr-approver
+module github.com/mallendem/gh-pr-review
 
 go 1.25
 

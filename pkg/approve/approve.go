@@ -3,8 +3,8 @@ package approve
 import (
 	"bufio"
 	"fmt"
+	"github.com/mallendem/gh-pr-review/pkg/gh"
 	"os"
-	"pr-approver/pkg/gh"
 	"sort"
 	"strings"
 )
