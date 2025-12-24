@@ -433,6 +433,48 @@ func autoApproveLinkedHashes(h string, approved, declined map[string]bool, hashP
 	}
 }
 
+// autoApproveLinkedHashesQuiet performs the same logic as autoApproveLinkedHashes but without printing.
+func autoApproveLinkedHashesQuiet(h string, approved, declined map[string]bool, hashPrMap gh.HashPrMap, prMap map[string][]string) {
+	if prs, ok := hashPrMap[h]; ok {
+		for _, pr := range prs {
+			prKey := pr.GetHTMLURL()
+			if linked, lok := prMap[prKey]; lok {
+				for _, linkedHash := range linked {
+					if linkedHash == h {
+						continue
+					}
+					if !approved[linkedHash] && !declined[linkedHash] {
+						approved[linkedHash] = true
+					}
+				}
+			}
+		}
+	}
+}
+
+// autoDeclineLinkedHashesQuiet mirrors autoDeclineLinkedHashes but does not print to stdout.
+// It updates the provided `declined` and `prSkipped` maps in-place.
+func AutoDeclineLinkedHashesQuiet(h string, declined, prSkipped map[string]bool, hashPrMap gh.HashPrMap, prMap map[string][]string) {
+	if prs, ok := hashPrMap[h]; ok {
+		for _, pr := range prs {
+			prKey := pr.GetHTMLURL()
+			if !prSkipped[prKey] {
+				prSkipped[prKey] = true
+			}
+			if linked, lok := prMap[prKey]; lok {
+				for _, linkedHash := range linked {
+					if linkedHash == h {
+						continue
+					}
+					if !declined[linkedHash] {
+						declined[linkedHash] = true
+					}
+				}
+			}
+		}
+	}
+}
+
 // autoDeclineLinkedHashes marks PRs containing `h` as skipped and marks other hashes
 // linked to those PRs as declined. It updates `declined` and `prSkipped` maps in-place.
 func autoDeclineLinkedHashes(h string, declined, prSkipped map[string]bool, hashPrMap gh.HashPrMap, prMap map[string][]string) {
@@ -450,11 +492,48 @@ func autoDeclineLinkedHashes(h string, declined, prSkipped map[string]bool, hash
 					}
 					if !declined[linkedHash] {
 						declined[linkedHash] = true
-						// ensure we won't prompt these later
 						fmt.Printf("%s\n", colorize(cYellow, fmt.Sprintf("Marked linked hash %s as declined due to PR %s", linkedHash, prKey)))
 					}
 				}
 			}
 		}
 	}
+}
+
+// RunProcessApprovals is an exported wrapper around the internal processApprovals
+// so external packages (e.g. a GUI) can trigger the same commit behaviour.
+func RunProcessApprovals(prMap map[string][]string, approved, declined, prSkipped map[string]bool, hashPrMap gh.HashPrMap, g *gh.GhClient, dryRun bool) {
+	processApprovals(prMap, approved, declined, prSkipped, hashPrMap, g, dryRun)
+}
+
+// AutoApproveLinkedHashes is an exported wrapper for auto-approving linked hashes
+// from the internal helper. It updates the provided approved/declined maps in-place.
+func AutoApproveLinkedHashes(h string, approved, declined map[string]bool, hashPrMap gh.HashPrMap, prMap map[string][]string) {
+	autoApproveLinkedHashes(h, approved, declined, hashPrMap, prMap)
+}
+
+// AutoDeclineLinkedHashes is an exported wrapper for auto-declining linked hashes
+// and marking PRs as skipped.
+func AutoDeclineLinkedHashes(h string, declined, prSkipped map[string]bool, hashPrMap gh.HashPrMap, prMap map[string][]string) {
+	autoDeclineLinkedHashes(h, declined, prSkipped, hashPrMap, prMap)
+}
+
+// AutoApproveLinkedHashesQuiet is exported for external callers (e.g., GUI) to auto-approve linked hashes without printing.
+func AutoApproveLinkedHashesQuiet(h string, approved, declined map[string]bool, hashPrMap gh.HashPrMap, prMap map[string][]string) {
+	autoApproveLinkedHashesQuiet(h, approved, declined, hashPrMap, prMap)
+}
+
+// PrepareManualApproval fetches the data required to run manual approval for the
+// provided user and returns the prepared slices/maps along with the GhClient.
+// This centralizes the network call so the GUI can reuse the same data path as
+// the interactive CLI.
+func PrepareManualApproval(user string) ([]string, gh.HashChangeMap, gh.HashPrMap, map[string][]string, *gh.GhClient, error) {
+	g := gh.NewGhClient()
+	userHashPrMap, changeMap, hashPrMap, prMap, err := g.GetPrReviewRequested()
+	if err != nil {
+		return nil, nil, nil, nil, nil, fmt.Errorf("error fetching PR review requests: %w", err)
+	}
+
+	hashes := collectHashesForUsers(user, userHashPrMap)
+	return hashes, changeMap, hashPrMap, prMap, g, nil
 }

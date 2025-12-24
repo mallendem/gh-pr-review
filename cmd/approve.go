@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"github.com/mallendem/gh-pr-review/pkg/approve"
+	"github.com/mallendem/gh-pr-review/pkg/gui"
 
 	"github.com/spf13/cobra"
 )
@@ -42,6 +43,23 @@ var manualCmd = &cobra.Command{
 	},
 }
 
+var guiCmd = &cobra.Command{
+	Use:   "gui",
+	Short: "Open interactive GUI for manual approvals",
+	Run: func(cmd *cobra.Command, args []string) {
+		user, _ := cmd.Flags().GetString("user")
+		if user == "" {
+			cmd.PrintErrln("--user is required for gui mode")
+			return
+		}
+		propagate, _ := cmd.Flags().GetBool("propagate")
+		dryRun, _ := cmd.Flags().GetBool("dry-run")
+		if err := gui.Run(user, propagate, dryRun); err != nil {
+			cmd.PrintErrf("failed to run gui: %v\n", err)
+		}
+	},
+}
+
 func init() {
 	rootCmd.AddCommand(approveCmd)
 	approveCmd.AddCommand(manualCmd)
@@ -57,11 +75,9 @@ func init() {
 	manualCmd.Flags().BoolP("propagate", "p", false, "When approving a hash, automatically approve linked hashes in the same PR")
 	manualCmd.Flags().BoolP("dry-run", "d", false, "Dry run: do not submit approvals, only print what would be approved")
 
-	// Cobra supports Persistent Flags which will work for this command
-	// and all subcommands, e.g.:
-	// approveCmd.PersistentFlags().String("foo", "", "A help for foo")
-
-	// Cobra supports local flags which will only run when this command
-	// is called directly, e.g.:
-	// approveCmd.Flags().BoolP("toggle", "t", false, "Help message for toggle")
+	// add gui subcommand flags
+	approveCmd.AddCommand(guiCmd)
+	guiCmd.Flags().StringP("user", "u", "", "User to run GUI manual approval for (required)")
+	guiCmd.Flags().BoolP("propagate", "p", false, "When approving a hash, automatically approve linked hashes in the same PR")
+	guiCmd.Flags().BoolP("dry-run", "d", false, "Dry run: do not submit approvals, only print what would be approved")
 }
