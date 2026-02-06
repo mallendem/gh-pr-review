@@ -18,11 +18,15 @@ import (
 
 // model holds the GUI state.
 type model struct {
-	hashes    []string
-	changeMap gh.HashChangeMap
-	hashPrMap gh.HashPrMap
-	prMap     map[string][]string
-	client    *gh.GhClient
+	// phase: 0 = user selection, 1 = approval (current view)
+	phase int
+
+	hashes      []string
+	changeMap   gh.HashChangeMap
+	hashPrMap   gh.HashPrMap
+	prMap       map[string][]string
+	verifiedMap gh.PrVerifiedMap
+	client      *gh.GhClient
 
 	approved  map[string]bool
 	declined  map[string]bool
@@ -49,33 +53,56 @@ type model struct {
 	stagedOffset  int
 	stagedPRList  []string
 	changeHOffset int // horizontal offset for changes column
+
+	// User selection phase (phase 0) fields
+	availableUsers  []string
+	userSelected    map[string]bool
+	userCursor      int
+	userHashPrMap   gh.GhPrHashMap
+	userScrollOffset int
 }
 
 // New creates and returns a Bubble Tea program configured for the user.
 func New(user string, propagate bool, dryRun bool) (*tea.Program, error) {
-	hashes, changeMap, hashPrMap, prMap, client, err := approve.PrepareManualApproval(user)
+	hashes, availableUsers, userHashPrMap, changeMap, hashPrMap, prMap, verifiedMap, client, err := approve.PrepareGUI(user)
 	if err != nil {
 		return nil, err
 	}
-	m := model{
-		hashes:       hashes,
-		changeMap:    changeMap,
-		hashPrMap:    hashPrMap,
-		prMap:        prMap,
-		client:       client,
-		approved:     map[string]bool{},
-		declined:     map[string]bool{},
-		prSkipped:    map[string]bool{},
-		committed:    map[string]bool{},
-		propagate:    propagate,
-		col:          0,
-		dryRun:       dryRun,
-		focusRow:     0,
-		stagedOffset: 0,
-		stagedPRList: nil,
+
+	// If user was provided (hashes already filtered), go straight to phase 1.
+	// Otherwise start in phase 0 (user selection).
+	phase := 0
+	if user != "" {
+		phase = 1
 	}
-	// compute initial staged list so the UI shows consistent state immediately
-	m.updateStagedList()
+
+	m := model{
+		phase:           phase,
+		hashes:          hashes,
+		changeMap:       changeMap,
+		hashPrMap:       hashPrMap,
+		prMap:           prMap,
+		verifiedMap:     verifiedMap,
+		client:          client,
+		approved:        map[string]bool{},
+		declined:        map[string]bool{},
+		prSkipped:       map[string]bool{},
+		committed:       map[string]bool{},
+		propagate:       propagate,
+		col:             0,
+		dryRun:          dryRun,
+		focusRow:        0,
+		stagedOffset:    0,
+		stagedPRList:    nil,
+		availableUsers:  availableUsers,
+		userSelected:    map[string]bool{},
+		userCursor:      0,
+		userHashPrMap:   userHashPrMap,
+	}
+	if phase == 1 {
+		// compute initial staged list so the UI shows consistent state immediately
+		m.updateStagedList()
+	}
 	// viewport will be sized once we receive a WindowSizeMsg in Update
 	m.viewport = viewport.Model{}
 	p := tea.NewProgram(m, tea.WithAltScreen())
@@ -95,6 +122,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if k == "q" || k == "esc" {
 			return m, tea.Quit
 		}
+
+		// Phase 0: user selection
+		if m.phase == 0 {
+			return m.updateUserSelection(k)
+		}
+
+		// Phase 1: approval view (existing logic)
 		// toggle focus between rows
 		if k == "tab" {
 			m.focusRow = (m.focusRow + 1) % 2
@@ -109,92 +143,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if k == "alt+d" {
-			// compute visible width for changes column (approx)
-			termW := m.termWidth
-			if termW == 0 {
-				termW = 120
-			}
-			// compute left/mid/right widths same as in View to get midWidth
-			leftMax := 0
-			for _, h := range m.hashes {
-				short := h
-				if len(h) > 6 {
-					short = h[:6]
-				}
-				if len(short) > leftMax {
-					leftMax = len(short)
-				}
-			}
-			leftWidth := leftMax + 4
-			if leftWidth < 8 {
-				leftWidth = 8
-			}
-			// compute right width from longest PR URL
-			maxPR := 0
-			for _, prs := range m.hashPrMap {
-				for _, pr := range prs {
-					l := len(pr.GetHTMLURL())
-					if l > maxPR {
-						maxPR = l
-					}
-				}
-			}
-			prWidth := maxPR + 6
-			if prWidth < 20 {
-				prWidth = 20
-			}
-			// Use a fixed-ish staged column width (wide enough for urls) and cap prWidth to avoid overflow
-			stagedWidth := 36
-			if stagedWidth > termW/4 {
-				stagedWidth = termW / 4
-			}
-			// cap prWidth so we have room for mid and staged
-			if prWidth > termW/3 {
-				prWidth = termW / 3
-			}
-			// allocate midWidth as remaining space; keep conservative padding for borders
-			midWidth := termW - leftWidth - prWidth - stagedWidth - 6
-			if midWidth < 10 {
-				// shrink prWidth if needed
-				extra := 10 - midWidth
-				if prWidth-extra > 10 {
-					prWidth -= extra
-				} else {
-					prWidth = 10
-				}
-				midWidth = termW - leftWidth - prWidth - stagedWidth - 6
-				if midWidth < 10 {
-					midWidth = 10
-					// if still too small, shrink stagedWidth
-					if stagedWidth > 20 {
-						stagedWidth = 20
-					}
-				}
-			}
-			contentW := midWidth - 4
-			if contentW < 10 {
-				contentW = 10
-			}
-			// determine maximum change line length for the selected hash
-			sel := ""
-			if len(m.hashes) > 0 && m.hashIndex < len(m.hashes) {
-				sel = m.hashes[m.hashIndex]
-			}
+			_, midWidth, _, _ := m.columnWidths()
+			contentW := max(midWidth-4, 10)
+			sel := m.selectedHash()
 			maxLen := 0
 			if sel != "" {
 				if changes, ok := m.changeMap[sel]; ok {
 					for _, cl := range changes {
-						if len(cl) > maxLen {
-							maxLen = len(cl)
-						}
+						maxLen = max(maxLen, len(cl))
 					}
 				}
 			}
-			maxOff := 0
-			if maxLen > contentW {
-				maxOff = maxLen - contentW
-			}
-			if m.changeHOffset < maxOff {
+			if maxOff := maxLen - contentW; m.changeHOffset < maxOff {
 				m.changeHOffset++
 			}
 			return m, nil
@@ -361,7 +321,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.approved[h] = true
 					if m.propagate {
 						// auto-approve linked hashes (quiet)
-						approve.AutoApproveLinkedHashesQuiet(h, m.approved, m.declined, m.hashPrMap, m.prMap)
+						approve.ApproveLinkedHashes(h, m.approved, m.declined, m.hashPrMap, m.prMap, true)
 					}
 					m.status = fmt.Sprintf("approved %s", h[:6])
 					// ensure UI reflects the change immediately
@@ -379,7 +339,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					delete(m.approved, h)
 					m.declined[h] = true
 					// auto-decline linked hashes quietly and mark PRs skipped
-					approve.AutoDeclineLinkedHashesQuiet(h, m.declined, m.prSkipped, m.hashPrMap, m.prMap)
+					approve.DeclineLinkedHashes(h, m.declined, m.prSkipped, m.hashPrMap, m.prMap, true)
 					// remove any hashes that got marked declined from approved map to keep state consistent
 					for dh := range m.declined {
 						if m.approved[dh] {
@@ -438,7 +398,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				// only call approval API for PRs that are fully approved
 				if len(filtered) > 0 {
-					approve.RunProcessApprovals(filtered, m.approved, m.declined, m.prSkipped, m.hashPrMap, m.client, m.dryRun)
+					approve.ProcessApprovals(filtered, m.approved, m.declined, m.prSkipped, m.hashPrMap, m.client, m.dryRun)
 					// mark hashes associated with filtered PRs as committed
 					for _, phashes := range filtered {
 						for _, ph := range phashes {
@@ -511,10 +471,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 // updateViewportContent updates the viewport with the PR body of the currently selected PR (first PR for selected hash)
 func (m *model) updateViewportContent() {
-	selectedHash := ""
-	if len(m.hashes) > 0 && m.hashIndex < len(m.hashes) {
-		selectedHash = m.hashes[m.hashIndex]
-	}
+	selectedHash := m.selectedHash()
 	body := ""
 	if selectedHash != "" {
 		if prs, ok := m.hashPrMap[selectedHash]; ok && len(prs) > 0 {
@@ -545,70 +502,11 @@ func (m *model) updateStagedList() {
 
 // View implements tea.Model
 func (m model) View() string {
-	// compute dynamic widths based on terminal size and content
-	termW := m.termWidth
-	if termW == 0 {
-		termW = 120
+	if m.phase == 0 {
+		return m.viewUserSelection()
 	}
 
-	// compute left width from longest short hash representation
-	leftMax := 0
-	for _, h := range m.hashes {
-		short := h
-		if len(h) > 6 {
-			short = h[:6]
-		}
-		if len(short) > leftMax {
-			leftMax = len(short)
-		}
-	}
-	leftWidth := leftMax + 4 // marker + space + padding
-	if leftWidth < 8 {
-		leftWidth = 8
-	}
-
-	// compute right width from longest PR URL
-	maxPR := 0
-	for _, prs := range m.hashPrMap {
-		for _, pr := range prs {
-			l := len(pr.GetHTMLURL())
-			if l > maxPR {
-				maxPR = l
-			}
-		}
-	}
-	prWidth := maxPR + 6
-	if prWidth < 20 {
-		prWidth = 20
-	}
-	// Use a fixed-ish staged column width (wide enough for urls) and cap prWidth to avoid overflow
-	stagedWidth := 36
-	if stagedWidth > termW/4 {
-		stagedWidth = termW / 4
-	}
-	// cap prWidth so we have room for mid and staged
-	if prWidth > termW/3 {
-		prWidth = termW / 3
-	}
-	// allocate midWidth as remaining space; keep conservative padding for borders
-	midWidth := termW - leftWidth - prWidth - stagedWidth - 6
-	if midWidth < 10 {
-		// shrink prWidth if needed
-		extra := 10 - midWidth
-		if prWidth-extra > 10 {
-			prWidth -= extra
-		} else {
-			prWidth = 10
-		}
-		midWidth = termW - leftWidth - prWidth - stagedWidth - 6
-		if midWidth < 10 {
-			midWidth = 10
-			// if still too small, shrink stagedWidth
-			if stagedWidth > 20 {
-				stagedWidth = 20
-			}
-		}
-	}
+	leftWidth, midWidth, prWidth, stagedWidth := m.columnWidths()
 
 	// apply the top row height to all three columns so the top region occupies the same vertical space
 	// subtract estimated extra space used by borders and padding so the rendered blocks fit the terminal
@@ -637,10 +535,7 @@ func (m model) View() string {
 	rightTitle := titleStyle.Render("Related PRs")
 	stagedTitle := titleStyle.Render("Staged changes")
 
-	selectedHash := ""
-	if len(m.hashes) > 0 && m.hashIndex < len(m.hashes) {
-		selectedHash = m.hashes[m.hashIndex]
-	}
+	selectedHash := m.selectedHash()
 
 	// left column: show hashes (6 chars)
 	var leftLines []string
@@ -923,39 +818,23 @@ func sliceForWindow(items []string, offset, visible int) []string {
 	return items[offset:end]
 }
 
+// isPRFullyApproved returns true if all hashes for the PR are approved (none declined).
+func (m *model) isPRFullyApproved(phashes []string) bool {
+	if len(m.approved) == 0 {
+		return false
+	}
+	for _, ph := range phashes {
+		if m.declined[ph] || !m.approved[ph] {
+			return false
+		}
+	}
+	return true
+}
+
 func (m *model) stagedPrKeys() []string {
-	stagedPRs := []string{}
+	var stagedPRs []string
 	for prKey, phashes := range m.prMap {
-		// compute if all hashes for this PR were declined
-		allDeclined := true
-		for _, ph := range phashes {
-			if !m.declined[ph] {
-				allDeclined = false
-				break
-			}
-		}
-		if allDeclined {
-			continue
-		}
-		// determine if all non-declined hashes are approved
-		allApproved := true
-		for _, ph := range phashes {
-			if m.declined[ph] {
-				allApproved = false
-				break
-			}
-			if len(m.approved) > 0 {
-				if !m.approved[ph] {
-					allApproved = false
-					break
-				}
-			} else {
-				allApproved = false
-				break
-			}
-		}
-		if allApproved {
-			// If this PR was previously skipped due to an earlier decline, unskip it now
+		if m.isPRFullyApproved(phashes) {
 			if m.prSkipped[prKey] {
 				delete(m.prSkipped, prKey)
 			}
@@ -966,44 +845,7 @@ func (m *model) stagedPrKeys() []string {
 	return stagedPRs
 }
 
-// isPRStaged returns true if the given PR meets the criteria to be staged:
-// - not skipped
-// - not all its hashes declined
-// - all non-declined hashes are approved (and there is at least one approval recorded)
-func (m *model) isPRStaged(prKey string) bool {
-	phashes, ok := m.prMap[prKey]
-	if !ok {
-		return false
-	}
-	if m.prSkipped[prKey] {
-		return false
-	}
-	allDeclined := true
-	for _, ph := range phashes {
-		if !m.declined[ph] {
-			allDeclined = false
-			break
-		}
-	}
-	if allDeclined {
-		return false
-	}
-	// require every non-declined hash to be approved and ensure we have approvals
-	if len(m.approved) == 0 {
-		return false
-	}
-	for _, ph := range phashes {
-		if m.declined[ph] {
-			return false
-		}
-		if !m.approved[ph] {
-			return false
-		}
-	}
-	return true
-}
-
-// prApprovalState returns (allApproved, anyDeclined, committed) for a PR based on current maps.
+// prApprovalState returns (allApproved, anyDeclined, committed) for a PR.
 func (m *model) prApprovalState(prKey string) (bool, bool, bool) {
 	hashes, ok := m.prMap[prKey]
 	if !ok {
@@ -1027,9 +869,9 @@ func (m *model) prApprovalState(prKey string) (bool, bool, bool) {
 	return allApproved, anyDeclined, allCommitted
 }
 
-// renderPRLabel returns a label for a PR with consistent coloring based on approval state.
 func (m *model) renderPRLabel(prKey string, idx int) string {
-	label := fmt.Sprintf("[%d] %s", idx+1, prKey)
+	verifiedIcon := approve.VerifiedIcon(m.verifiedMap[prKey])
+	label := fmt.Sprintf("[%d] %s %s", idx+1, verifiedIcon, prKey)
 	allApproved, anyDeclined, committed := m.prApprovalState(prKey)
 	if committed {
 		return lipgloss.NewStyle().Foreground(lipgloss.Color("6")).Render(label)
@@ -1043,41 +885,179 @@ func (m *model) renderPRLabel(prKey string, idx int) string {
 	return label
 }
 
-// reconcilePrSkipped checks PRs that were previously skipped and unskips any that
-// now meet the staging criteria (i.e., not all-declined and all non-declined hashes approved).
 func (m *model) reconcilePrSkipped() {
 	for prKey, phashes := range m.prMap {
-		if !m.prSkipped[prKey] {
-			continue
-		}
-		// skip if all hashes for this PR are still declined
-		allDeclined := true
-		for _, ph := range phashes {
-			if !m.declined[ph] {
-				allDeclined = false
-				break
-			}
-		}
-		if allDeclined {
-			continue
-		}
-		// require every non-declined hash to be approved and ensure we have approvals
-		if len(m.approved) == 0 {
-			continue
-		}
-		allApproved := true
-		for _, ph := range phashes {
-			if m.declined[ph] {
-				allApproved = false
-				break
-			}
-			if !m.approved[ph] {
-				allApproved = false
-				break
-			}
-		}
-		if allApproved {
+		if m.prSkipped[prKey] && m.isPRFullyApproved(phashes) {
 			delete(m.prSkipped, prKey)
 		}
 	}
+}
+
+// selectedHash returns the currently selected hash or empty string.
+func (m model) selectedHash() string {
+	if len(m.hashes) > 0 && m.hashIndex < len(m.hashes) {
+		return m.hashes[m.hashIndex]
+	}
+	return ""
+}
+
+// columnWidths computes the 4-column layout widths (left, mid, pr, staged).
+func (m model) columnWidths() (int, int, int, int) {
+	termW := m.termWidth
+	if termW == 0 {
+		termW = 120
+	}
+
+	leftMax := 0
+	for _, h := range m.hashes {
+		short := h
+		if len(h) > 6 {
+			short = h[:6]
+		}
+		leftMax = max(leftMax, len(short))
+	}
+	leftWidth := max(leftMax+4, 8)
+
+	maxPR := 0
+	for _, prs := range m.hashPrMap {
+		for _, pr := range prs {
+			maxPR = max(maxPR, len(pr.GetHTMLURL()))
+		}
+	}
+	prWidth := max(maxPR+6, 20)
+	stagedWidth := min(36, termW/4)
+	prWidth = min(prWidth, termW/3)
+
+	midWidth := termW - leftWidth - prWidth - stagedWidth - 6
+	if midWidth < 10 {
+		extra := 10 - midWidth
+		if prWidth-extra > 10 {
+			prWidth -= extra
+		} else {
+			prWidth = 10
+		}
+		midWidth = termW - leftWidth - prWidth - stagedWidth - 6
+		if midWidth < 10 {
+			midWidth = 10
+			stagedWidth = min(stagedWidth, 20)
+		}
+	}
+	return leftWidth, midWidth, prWidth, stagedWidth
+}
+
+// --- Phase 0: User selection ---
+
+// updateUserSelection handles key input during the user selection phase.
+func (m model) updateUserSelection(k string) (tea.Model, tea.Cmd) {
+	switch k {
+	case "w", "up":
+		if m.userCursor > 0 {
+			m.userCursor--
+			visible := m.userSelectionVisibleLines()
+			ensureOffset(&m.userScrollOffset, m.userCursor, visible)
+		}
+	case "s", "down":
+		if m.userCursor < len(m.availableUsers)-1 {
+			m.userCursor++
+			visible := m.userSelectionVisibleLines()
+			ensureOffset(&m.userScrollOffset, m.userCursor, visible)
+		}
+	case " ", "x":
+		if m.userCursor >= 0 && m.userCursor < len(m.availableUsers) {
+			u := m.availableUsers[m.userCursor]
+			m.userSelected[u] = !m.userSelected[u]
+		}
+	case "enter":
+		// collect selected users
+		var selected []string
+		for _, u := range m.availableUsers {
+			if m.userSelected[u] {
+				selected = append(selected, u)
+			}
+		}
+		if len(selected) == 0 {
+			return m, nil
+		}
+		// filter hashes for selected users
+		joined := strings.Join(selected, ",")
+		m.hashes = approve.CollectHashesForUsers(joined, m.userHashPrMap)
+		m.phase = 1
+		m.updateStagedList()
+		m.updateViewportContent()
+	}
+	return m, nil
+}
+
+// userSelectionVisibleLines returns the number of user lines visible in the selection panel.
+func (m model) userSelectionVisibleLines() int {
+	// Use most of the terminal height minus header/footer/borders
+	h := m.termHeight - 8
+	if h < 1 {
+		h = 1
+	}
+	return h
+}
+
+// userPRCount returns the number of unique PRs for a given user.
+func (m model) userPRCount(user string) int {
+	hashMap, ok := m.userHashPrMap[user]
+	if !ok {
+		return 0
+	}
+	seen := map[string]struct{}{}
+	for _, prs := range hashMap {
+		for _, pr := range prs {
+			seen[pr.GetHTMLURL()] = struct{}{}
+		}
+	}
+	return len(seen)
+}
+
+// viewUserSelection renders the user selection panel.
+func (m model) viewUserSelection() string {
+	titleStyle := lipgloss.NewStyle().Bold(true)
+	title := titleStyle.Render("Select users to review (space/x: toggle, enter: confirm, q: quit)")
+
+	visible := m.userSelectionVisibleLines()
+
+	var lines []string
+	for i, u := range m.availableUsers {
+		check := "[ ]"
+		if m.userSelected[u] {
+			check = "[x]"
+		}
+		prCount := m.userPRCount(u)
+		label := fmt.Sprintf("%s %s (%d PRs)", check, u, prCount)
+		if i == m.userCursor {
+			label = lipgloss.NewStyle().Background(lipgloss.Color("62")).Render(label)
+		}
+		lines = append(lines, label)
+	}
+
+	// apply scrolling
+	offset := m.userScrollOffset
+	if offset < 0 {
+		offset = 0
+	}
+	if offset > len(lines)-visible {
+		offset = len(lines) - visible
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	window := sliceForWindow(lines, offset, visible)
+
+	panelWidth := m.termWidth - 4
+	if panelWidth < 30 {
+		panelWidth = 30
+	}
+	panelHeight := visible + 2
+	panel := lipgloss.NewStyle().
+		Width(panelWidth).
+		Height(panelHeight).
+		Border(lipgloss.NormalBorder()).
+		Padding(1).
+		Render(strings.Join(window, "\n"))
+
+	return lipgloss.JoinVertical(lipgloss.Left, title, panel)
 }

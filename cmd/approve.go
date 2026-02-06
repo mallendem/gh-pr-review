@@ -48,10 +48,6 @@ var guiCmd = &cobra.Command{
 	Short: "Open interactive GUI for manual approvals",
 	Run: func(cmd *cobra.Command, args []string) {
 		user, _ := cmd.Flags().GetString("user")
-		if user == "" {
-			cmd.PrintErrln("--user is required for gui mode")
-			return
-		}
 		propagate, _ := cmd.Flags().GetBool("propagate")
 		dryRun, _ := cmd.Flags().GetBool("dry-run")
 		if err := gui.Run(user, propagate, dryRun); err != nil {
@@ -64,10 +60,8 @@ func init() {
 	rootCmd.AddCommand(approveCmd)
 	approveCmd.AddCommand(manualCmd)
 
-	// Here you will define your flags and configuration settings.
 	approveCmd.Flags().StringSliceP("user", "u", nil, "Comma-separated list of users to show changes for (e.g. alice,bob)")
 	approveCmd.Flags().StringSliceP("hash", "x", nil, "Comma-separated list of hash values to approve PRs for (e.g. abc123,def456)")
-	approveCmd.Flags().StringSlice("approve-user", nil, "Comma-separated list of users whose PRs to approve (e.g. alice,bob)")
 	approveCmd.Flags().BoolP("only-users", "o", false, "Return only the list of users with pending PR reviews")
 
 	// manual subcommand flags
@@ -77,7 +71,7 @@ func init() {
 
 	// add gui subcommand flags
 	approveCmd.AddCommand(guiCmd)
-	guiCmd.Flags().StringP("user", "u", "", "User to run GUI manual approval for (required)")
+	guiCmd.Flags().StringP("user", "u", "", "User to run GUI manual approval for (shows selection panel if omitted)")
 	guiCmd.Flags().BoolP("propagate", "p", false, "When approving a hash, automatically approve linked hashes in the same PR")
 	guiCmd.Flags().BoolP("dry-run", "d", false, "Dry run: do not submit approvals, only print what would be approved")
 }

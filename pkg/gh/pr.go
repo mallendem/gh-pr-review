@@ -14,7 +14,6 @@ import (
 	"sync"
 
 	"github.com/google/go-github/v72/github"
-	"github.com/mallendem/gh-pr-review/pkg/utils"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -39,141 +38,149 @@ func (g *GhClient) getPrHash(pr *github.PullRequest) ([]string, map[string][]str
 	diff := string(diffBytes)
 
 	var hashes []string
-	hunkLines := make([]string, 0)
+	var hunkLines []string
 	inHunk := false
 	hunkMap := make(map[string][]string)
 
-	for _, line := range strings.Split(diff, "\n") {
-		if strings.HasPrefix(line, "@@") {
-			if len(hunkLines) > 0 {
-				hash := sha256.Sum256([]byte(strings.Join(hunkLines, "\n")))
-				h := hex.EncodeToString(hash[:])
-				hashes = append(hashes, h)
-				hunkMap[h] = append([]string(nil), hunkLines...) // copy
-				hunkLines = nil
-			}
-			inHunk = true
-			continue
+	flushHunk := func() {
+		if len(hunkLines) == 0 {
+			return
 		}
-		if inHunk {
-			// Only consider added/removed lines, not file headers
-			if (strings.HasPrefix(line, "+") || strings.HasPrefix(line, "-")) &&
-				!strings.HasPrefix(line, "+++") && !strings.HasPrefix(line, "---") {
-				hunkLines = append(hunkLines, line)
-			}
-		}
-	}
-	// Hash the last hunk if present
-	if len(hunkLines) > 0 {
 		hash := sha256.Sum256([]byte(strings.Join(hunkLines, "\n")))
 		h := hex.EncodeToString(hash[:])
 		hashes = append(hashes, h)
 		hunkMap[h] = append([]string(nil), hunkLines...)
+		hunkLines = nil
 	}
+
+	for _, line := range strings.Split(diff, "\n") {
+		if strings.HasPrefix(line, "@@") {
+			flushHunk()
+			inHunk = true
+			continue
+		}
+		if inHunk {
+			if (strings.HasPrefix(line, "+") || strings.HasPrefix(line, "-")) &&
+				!strings.HasPrefix(line, "+++") && !strings.HasPrefix(line, "---") {
+				// Strip leading whitespace after the +/- prefix so indentation
+				// differences don't produce different hashes.
+				normalized := line[:1] + strings.TrimLeft(line[1:], " \t")
+				hunkLines = append(hunkLines, normalized)
+			}
+		}
+	}
+	flushHunk()
 
 	return hashes, hunkMap, nil
 }
 
-func (g *GhClient) GetPrReviewRequested() (GhPrHashMap, HashChangeMap, HashPrMap, PrHashMap, error) {
+func (g *GhClient) GetPrReviewRequested() (GhPrHashMap, HashChangeMap, HashPrMap, PrHashMap, PrVerifiedMap, error) {
 	userHashPrMap := make(GhPrHashMap)
 	n, err := g.getNotifications()
 	if err != nil {
-		return nil, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, err
 	}
 
 	hashChangeMap := make(map[string][]string)
 	hashPrMap := make(HashPrMap)
 	prHashMap := make(PrHashMap)
+	prVerifiedMap := make(PrVerifiedMap)
 
-	m := sync.Mutex{}
+	mu := sync.Mutex{}
 	eg := new(errgroup.Group)
 	eg.SetLimit(CONCURRENCY_LIMIT)
 
 	for _, notification := range n {
-		notification := notification // capture loop variable
 		eg.Go(func() error {
-			if notification.GetReason() == "review_requested" {
-				url := notification.GetSubject().GetURL()
-				pr, _, err := g.c.PullRequests.Get(
-					context.Background(),
-					notification.GetRepository().GetOwner().GetLogin(),
-					notification.GetRepository().GetName(),
-					utils.Must(strconv.Atoi(strings.Split(url, "/pulls/")[1])),
-				)
-				if err != nil {
-					return err
-				}
-				if pr == nil || pr.GetState() != "open" {
-					return nil
-				}
-				prUser := pr.GetUser().GetLogin()
-
-				// get hashes and local map (no shared map mutation here)
-				prHash, prMap, err := g.getPrHash(pr)
-				if err != nil {
-					return err
-				}
-
-				// merge under lock
-				m.Lock()
-				if userHashPrMap[prUser] == nil {
-					userHashPrMap[prUser] = make(map[string][]*github.PullRequest)
-				}
-				prKey := pr.GetHTMLURL()
-				for _, h := range prHash {
-					// append pr to userHashPrMap[prUser][h] if not present
-					present := false
-					for _, exist := range userHashPrMap[prUser][h] {
-						if exist.GetHTMLURL() == prKey {
-							present = true
-							break
-						}
-					}
-					if !present {
-						userHashPrMap[prUser][h] = append(userHashPrMap[prUser][h], pr)
-					}
-
-					// also populate global hash->PR map with dedupe by URL
-					prList := hashPrMap[h]
-					found := false
-					for _, exist := range prList {
-						if exist.GetHTMLURL() == prKey {
-							found = true
-							break
-						}
-					}
-					if !found {
-						hashPrMap[h] = append(hashPrMap[h], pr)
-					}
-
-					// populate PR->hash map with dedupe
-					hashes := prHashMap[prKey]
-					have := false
-					for _, existH := range hashes {
-						if existH == h {
-							have = true
-							break
-						}
-					}
-					if !have {
-						prHashMap[prKey] = append(prHashMap[prKey], h)
-					}
-				}
-				for k, v := range prMap {
-					if _, ok := hashChangeMap[k]; !ok {
-						hashChangeMap[k] = v
-					}
-				}
-				m.Unlock()
+			if notification.GetReason() != "review_requested" {
+				return nil
 			}
+			url := notification.GetSubject().GetURL()
+			owner := notification.GetRepository().GetOwner().GetLogin()
+			repo := notification.GetRepository().GetName()
+			prNumber, err := strconv.Atoi(strings.Split(url, "/pulls/")[1])
+			if err != nil {
+				return fmt.Errorf("failed to parse PR number from %s: %w", url, err)
+			}
+			pr, _, err := g.c.PullRequests.Get(context.Background(), owner, repo, prNumber)
+			if err != nil {
+				return err
+			}
+			if pr == nil || pr.GetState() != "open" {
+				return nil
+			}
+			prUser := pr.GetUser().GetLogin()
+
+			prHash, localChangeMap, err := g.getPrHash(pr)
+			if err != nil {
+				return err
+			}
+
+			verified := g.areCommitsVerified(owner, repo, pr.GetNumber())
+
+			mu.Lock()
+			if userHashPrMap[prUser] == nil {
+				userHashPrMap[prUser] = make(map[string][]*github.PullRequest)
+			}
+			prKey := pr.GetHTMLURL()
+			prVerifiedMap[prKey] = verified
+			for _, h := range prHash {
+				if !containsPR(userHashPrMap[prUser][h], prKey) {
+					userHashPrMap[prUser][h] = append(userHashPrMap[prUser][h], pr)
+				}
+				if !containsPR(hashPrMap[h], prKey) {
+					hashPrMap[h] = append(hashPrMap[h], pr)
+				}
+				if !containsString(prHashMap[prKey], h) {
+					prHashMap[prKey] = append(prHashMap[prKey], h)
+				}
+			}
+			for k, v := range localChangeMap {
+				if _, ok := hashChangeMap[k]; !ok {
+					hashChangeMap[k] = v
+				}
+			}
+			mu.Unlock()
 			return nil
 		})
 	}
 
-	if err := eg.Wait(); err == nil {
-		return userHashPrMap, hashChangeMap, hashPrMap, prHashMap, nil
+	if err := eg.Wait(); err != nil {
+		return nil, nil, nil, nil, nil, err
 	}
-	return nil, nil, nil, nil, nil
+	return userHashPrMap, hashChangeMap, hashPrMap, prHashMap, prVerifiedMap, nil
+}
+
+func containsPR(prs []*github.PullRequest, url string) bool {
+	for _, pr := range prs {
+		if pr.GetHTMLURL() == url {
+			return true
+		}
+	}
+	return false
+}
+
+func containsString(ss []string, s string) bool {
+	for _, v := range ss {
+		if v == s {
+			return true
+		}
+	}
+	return false
+}
+
+// areCommitsVerified checks whether all commits in a PR are verified (signed).
+func (g *GhClient) areCommitsVerified(owner, repo string, number int) bool {
+	commits, _, err := g.c.PullRequests.ListCommits(context.Background(), owner, repo, number, nil)
+	if err != nil {
+		return false
+	}
+	for _, c := range commits {
+		if c.GetCommit().GetVerification().GetVerified() != true {
+			return false
+		}
+	}
+	return len(commits) > 0
 }
 
 func (g *GhClient) ApprovePr(pr *github.PullRequest) error {
@@ -200,7 +207,7 @@ func (g *GhClient) ApprovePr(pr *github.PullRequest) error {
 		if err != nil {
 			fmt.Printf("warning: failed to check branch status for PR %s: %v\n", pr.GetHTMLURL(), err)
 		} else if behind {
-			if err := g.tryUpdateBranch(owner, repo, number, pr); err != nil {
+			if err := g.tryUpdateBranch(owner, repo, number); err != nil {
 				// TODO: this doesn't work, no idea why rebasing via API is so broken,
 				// but we should detect if we _need_ to rebase first before trying, and
 				// if it fails, we should return errors properly.
@@ -245,11 +252,11 @@ func (g *GhClient) ApprovePr(pr *github.PullRequest) error {
 func (g *GhClient) tryEnableAutoMerge(nodeID string, pr *github.PullRequest) error {
 	graphqlURL := "https://api.github.com/graphql"
 	mutation := `mutation EnableAutoMerge($pullId:ID!, $mergeMethod:PullRequestMergeMethod!) { enablePullRequestAutoMerge(input:{pullRequestId:$pullId, mergeMethod:$mergeMethod}) { pullRequest { id } } }`
-	vars := map[string]interface{}{
+	vars := map[string]any{
 		"pullId":      nodeID,
 		"mergeMethod": "SQUASH",
 	}
-	payload := map[string]interface{}{
+	payload := map[string]any{
 		"query":     mutation,
 		"variables": vars,
 	}
@@ -260,7 +267,7 @@ func (g *GhClient) tryEnableAutoMerge(nodeID string, pr *github.PullRequest) err
 	}
 	reqGQL.Header.Set("Accept", "application/vnd.github+json")
 	reqGQL.Header.Set("Content-Type", "application/json")
-	reqGQL.Header.Set("Authorization", "Bearer "+g.t)
+	reqGQL.Header.Set("Authorization", "Bearer "+g.token)
 	respGQL, err := g.c.Client().Do(reqGQL)
 	if err != nil {
 		return fmt.Errorf("GraphQL request failed for PR %s: %w", pr.GetHTMLURL(), err)
@@ -272,8 +279,8 @@ func (g *GhClient) tryEnableAutoMerge(nodeID string, pr *github.PullRequest) err
 	}
 	// inspect response for GraphQL errors
 	var gqlResp struct {
-		Data   interface{}              `json:"data"`
-		Errors []map[string]interface{} `json:"errors"`
+		Data   any              `json:"data"`
+		Errors []map[string]any `json:"errors"`
 	}
 	if err := json.Unmarshal(body, &gqlResp); err != nil {
 		return fmt.Errorf("failed to decode GraphQL response for PR %s: %w", pr.GetHTMLURL(), err)
@@ -298,7 +305,7 @@ func (g *GhClient) GetPrComment(pr *github.PullRequest) (string, error) {
 }
 
 func (g *GhClient) PrintChangesPerUser(users []string) {
-	userHashPrMap, hashChangeMap, _, prHashMap, err := g.GetPrReviewRequested()
+	userHashPrMap, hashChangeMap, _, prHashMap, _, err := g.GetPrReviewRequested()
 	if err != nil {
 		fmt.Printf("Error fetching PR review requests: %v\n", err)
 		return

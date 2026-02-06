@@ -11,7 +11,7 @@ import (
 )
 
 // tryUpdateBranch tries to rebase the branch for the given PR.
-func (g *GhClient) tryUpdateBranch(owner, repo string, number int, pr *github.PullRequest) error {
+func (g *GhClient) tryUpdateBranch(owner, repo string, number int) error {
 	_, _, err := g.c.PullRequests.UpdateBranch(
 		context.Background(),
 		owner,
@@ -39,7 +39,7 @@ func (g *GhClient) isBranchBehind(owner, repo, baseRef, headRef string) (bool, e
 		return false, fmt.Errorf("failed to build compare request: %w", err)
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
-	req.Header.Set("Authorization", "Bearer "+g.t)
+	req.Header.Set("Authorization", "Bearer "+g.token)
 
 	resp, err := g.c.Client().Do(req)
 	if err != nil {
