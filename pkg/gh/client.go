@@ -9,8 +9,8 @@ import (
 )
 
 type GhClient struct {
-	c *github.Client
-	t string
+	c     *github.Client
+	token string
 }
 
 func NewGhClient() *GhClient {
@@ -27,7 +27,7 @@ func NewGhClient() *GhClient {
 	client := github.NewClient(tc)
 
 	return &GhClient{
-		c: client,
-		t: ghToken,
+		c:     client,
+		token: ghToken,
 	}
 }
