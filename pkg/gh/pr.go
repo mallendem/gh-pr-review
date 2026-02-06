@@ -17,23 +17,23 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-func (g *GhClient) getPrHash(pr *github.PullRequest) ([]string, map[string][]string, error) {
+func (g *GhClient) getPrHash(pr *github.PullRequest) ([]string, map[string][]string, map[string]string, error) {
 	diffURL := pr.GetURL()
 	req, err := http.NewRequest("GET", diffURL, nil)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	req.Header.Set("Accept", "application/vnd.github.diff")
 
 	resp, err := g.c.Client().Do(req)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	diffBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	diff := string(diffBytes)
 
@@ -41,6 +41,8 @@ func (g *GhClient) getPrHash(pr *github.PullRequest) ([]string, map[string][]str
 	var hunkLines []string
 	inHunk := false
 	hunkMap := make(map[string][]string)
+	hashFileMap := make(map[string]string)
+	currentFile := ""
 
 	flushHunk := func() {
 		if len(hunkLines) == 0 {
@@ -50,10 +52,19 @@ func (g *GhClient) getPrHash(pr *github.PullRequest) ([]string, map[string][]str
 		h := hex.EncodeToString(hash[:])
 		hashes = append(hashes, h)
 		hunkMap[h] = append([]string(nil), hunkLines...)
+		hashFileMap[h] = currentFile
 		hunkLines = nil
 	}
 
 	for _, line := range strings.Split(diff, "\n") {
+		if strings.HasPrefix(line, "diff --git ") {
+			flushHunk()
+			inHunk = false
+			if idx := strings.LastIndex(line, " b/"); idx >= 0 {
+				currentFile = line[idx+3:]
+			}
+			continue
+		}
 		if strings.HasPrefix(line, "@@") {
 			flushHunk()
 			inHunk = true
@@ -71,20 +82,21 @@ func (g *GhClient) getPrHash(pr *github.PullRequest) ([]string, map[string][]str
 	}
 	flushHunk()
 
-	return hashes, hunkMap, nil
+	return hashes, hunkMap, hashFileMap, nil
 }
 
-func (g *GhClient) GetPrReviewRequested() (GhPrHashMap, HashChangeMap, HashPrMap, PrHashMap, PrVerifiedMap, error) {
+func (g *GhClient) GetPrReviewRequested() (GhPrHashMap, HashChangeMap, HashPrMap, PrHashMap, PrVerifiedMap, HashFileMap, error) {
 	userHashPrMap := make(GhPrHashMap)
 	n, err := g.getNotifications()
 	if err != nil {
-		return nil, nil, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, nil, err
 	}
 
 	hashChangeMap := make(map[string][]string)
 	hashPrMap := make(HashPrMap)
 	prHashMap := make(PrHashMap)
 	prVerifiedMap := make(PrVerifiedMap)
+	hashFileMap := make(HashFileMap)
 
 	mu := sync.Mutex{}
 	eg := new(errgroup.Group)
@@ -111,7 +123,7 @@ func (g *GhClient) GetPrReviewRequested() (GhPrHashMap, HashChangeMap, HashPrMap
 			}
 			prUser := pr.GetUser().GetLogin()
 
-			prHash, localChangeMap, err := g.getPrHash(pr)
+			prHash, localChangeMap, localFileMap, err := g.getPrHash(pr)
 			if err != nil {
 				return err
 			}
@@ -140,15 +152,20 @@ func (g *GhClient) GetPrReviewRequested() (GhPrHashMap, HashChangeMap, HashPrMap
 					hashChangeMap[k] = v
 				}
 			}
+			for k, v := range localFileMap {
+				if _, ok := hashFileMap[k]; !ok {
+					hashFileMap[k] = v
+				}
+			}
 			mu.Unlock()
 			return nil
 		})
 	}
 
 	if err := eg.Wait(); err != nil {
-		return nil, nil, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, nil, err
 	}
-	return userHashPrMap, hashChangeMap, hashPrMap, prHashMap, prVerifiedMap, nil
+	return userHashPrMap, hashChangeMap, hashPrMap, prHashMap, prVerifiedMap, hashFileMap, nil
 }
 
 func containsPR(prs []*github.PullRequest, url string) bool {
@@ -305,7 +322,7 @@ func (g *GhClient) GetPrComment(pr *github.PullRequest) (string, error) {
 }
 
 func (g *GhClient) PrintChangesPerUser(users []string) {
-	userHashPrMap, hashChangeMap, _, prHashMap, _, err := g.GetPrReviewRequested()
+	userHashPrMap, hashChangeMap, _, prHashMap, _, _, err := g.GetPrReviewRequested()
 	if err != nil {
 		fmt.Printf("Error fetching PR review requests: %v\n", err)
 		return

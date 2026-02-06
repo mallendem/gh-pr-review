@@ -24,6 +24,9 @@ type PrHashMap map[string][]string
 // PrVerifiedMap maps a PR identifier (HTML URL) to whether all its commits are verified (signed)
 type PrVerifiedMap map[string]bool
 
+// HashFileMap maps hash strings to the filename the hunk belongs to
+type HashFileMap map[string]string
+
 func (g *GhClient) getNotifications() ([]*github.Notification, error) {
 	var allNotifications []*github.Notification
 	opt := &github.NotificationListOptions{

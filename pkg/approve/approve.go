@@ -32,7 +32,7 @@ func ApprovePullRequest(users []string) error {
 
 func PrintUsersWithPrs() {
 	g := gh.NewGhClient()
-	userHashPrMap, _, _, _, _, err := g.GetPrReviewRequested()
+	userHashPrMap, _, _, _, _, _, err := g.GetPrReviewRequested()
 	if err != nil {
 		fmt.Println(colorize(cYellow, fmt.Sprintf("Error fetching PR review requests: %v", err)))
 		return
@@ -49,7 +49,7 @@ func PrintUsersWithPrs() {
 
 func ApprovePrByHash(hashes []string) {
 	g := gh.NewGhClient()
-	_, changeMap, hMap, prMap, _, err := g.GetPrReviewRequested()
+	_, changeMap, hMap, prMap, _, _, err := g.GetPrReviewRequested()
 	if err != nil {
 		fmt.Println(colorize(cYellow, fmt.Sprintf("Error fetching PR review requests: %v", err)))
 		return
@@ -94,7 +94,7 @@ func ApprovePrByHash(hashes []string) {
 // skips actual GitHub API calls.
 func ManualApproval(user string, propagate bool, dryRun bool) error {
 	g := gh.NewGhClient()
-	userHashPrMap, changeMap, hashPrMap, prMap, verifiedMap, err := g.GetPrReviewRequested()
+	userHashPrMap, changeMap, hashPrMap, prMap, verifiedMap, _, err := g.GetPrReviewRequested()
 	if err != nil {
 		return fmt.Errorf("error fetching PR review requests: %w", err)
 	}
@@ -438,11 +438,11 @@ func DeclineLinkedHashes(h string, declined, prSkipped map[string]bool, hashPrMa
 // PrepareGUI fetches data and, if user is empty, returns the list of available
 // usernames so a selection panel can be shown. When user is non-empty it behaves
 // like PrepareManualApproval and pre-filters hashes for that user.
-func PrepareGUI(user string) (hashes []string, availableUsers []string, userHashPrMap gh.GhPrHashMap, changeMap gh.HashChangeMap, hashPrMap gh.HashPrMap, prMap map[string][]string, verifiedMap gh.PrVerifiedMap, client *gh.GhClient, err error) {
+func PrepareGUI(user string) (hashes []string, availableUsers []string, userHashPrMap gh.GhPrHashMap, changeMap gh.HashChangeMap, hashPrMap gh.HashPrMap, prMap map[string][]string, verifiedMap gh.PrVerifiedMap, hashFileMap gh.HashFileMap, client *gh.GhClient, err error) {
 	client = gh.NewGhClient()
-	userHashPrMap, changeMap, hashPrMap, prMap, verifiedMap, err = client.GetPrReviewRequested()
+	userHashPrMap, changeMap, hashPrMap, prMap, verifiedMap, hashFileMap, err = client.GetPrReviewRequested()
 	if err != nil {
-		return nil, nil, nil, nil, nil, nil, nil, nil, fmt.Errorf("error fetching PR review requests: %w", err)
+		return nil, nil, nil, nil, nil, nil, nil, nil, nil, fmt.Errorf("error fetching PR review requests: %w", err)
 	}
 	// build sorted list of available users
 	for u := range userHashPrMap {
@@ -465,7 +465,7 @@ func CollectHashesForUsers(user string, userHashPrMap gh.GhPrHashMap) []string {
 // PrepareManualApproval fetches data required for manual approval (used by both CLI and GUI).
 func PrepareManualApproval(user string) ([]string, gh.HashChangeMap, gh.HashPrMap, map[string][]string, gh.PrVerifiedMap, *gh.GhClient, error) {
 	g := gh.NewGhClient()
-	userHashPrMap, changeMap, hashPrMap, prMap, verifiedMap, err := g.GetPrReviewRequested()
+	userHashPrMap, changeMap, hashPrMap, prMap, verifiedMap, _, err := g.GetPrReviewRequested()
 	if err != nil {
 		return nil, nil, nil, nil, nil, nil, fmt.Errorf("error fetching PR review requests: %w", err)
 	}

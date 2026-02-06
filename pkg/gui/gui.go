@@ -54,6 +54,10 @@ type model struct {
 	stagedPRList  []string
 	changeHOffset int // horizontal offset for changes column
 
+	// File tab state for changes panel
+	hashFileMap   gh.HashFileMap // hash → filename
+	changeFileTab int           // index of selected file tab
+
 	// User selection phase (phase 0) fields
 	availableUsers  []string
 	userSelected    map[string]bool
@@ -64,7 +68,7 @@ type model struct {
 
 // New creates and returns a Bubble Tea program configured for the user.
 func New(user string, propagate bool, dryRun bool) (*tea.Program, error) {
-	hashes, availableUsers, userHashPrMap, changeMap, hashPrMap, prMap, verifiedMap, client, err := approve.PrepareGUI(user)
+	hashes, availableUsers, userHashPrMap, changeMap, hashPrMap, prMap, verifiedMap, hashFileMap, client, err := approve.PrepareGUI(user)
 	if err != nil {
 		return nil, err
 	}
@@ -94,6 +98,7 @@ func New(user string, propagate bool, dryRun bool) (*tea.Program, error) {
 		focusRow:        0,
 		stagedOffset:    0,
 		stagedPRList:    nil,
+		hashFileMap:     hashFileMap,
 		availableUsers:  availableUsers,
 		userSelected:    map[string]bool{},
 		userCursor:      0,
@@ -145,18 +150,29 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if k == "alt+d" {
 			_, midWidth, _, _ := m.columnWidths()
 			contentW := max(midWidth-4, 10)
-			sel := m.selectedHash()
 			maxLen := 0
-			if sel != "" {
-				if changes, ok := m.changeMap[sel]; ok {
-					for _, cl := range changes {
-						maxLen = max(maxLen, len(cl))
-					}
-				}
+			for _, cl := range m.changesForFileTab() {
+				maxLen = max(maxLen, len(cl))
 			}
 			if maxOff := maxLen - contentW; m.changeHOffset < maxOff {
 				m.changeHOffset++
 			}
+			return m, nil
+		}
+
+		// column navigation (works in both rows)
+		if k == "a" { // left
+			if m.col > 0 {
+				m.col--
+			}
+			m.focusRow = 0
+			return m, nil
+		}
+		if k == "d" { // right
+			if m.col < 3 {
+				m.col++
+			}
+			m.focusRow = 0
 			return m, nil
 		}
 
@@ -182,19 +198,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		// when top row is focused, w/s navigate hashes
 		if m.focusRow == 0 {
-			// column navigation
-			if k == "a" { // left
-				if m.col > 0 {
-					m.col--
-				}
-				return m, nil
-			}
-			if k == "d" { // right
-				if m.col < 3 {
-					m.col++
-				}
-				return m, nil
-			}
 			// behavior depends on which top column is active:
 			// - col 0 (hashes): w/s move the selection
 			// - col 1 (changes): w/s scroll the changes pane
@@ -222,6 +225,24 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m, nil
 				}
 			} else if m.col == 1 {
+				// file tab navigation
+				if k == "e" {
+					if m.changeFileTab > 0 {
+						m.changeFileTab--
+						m.changeOffset = 0
+						m.changeHOffset = 0
+					}
+					return m, nil
+				}
+				if k == "r" {
+					files := m.changeFilesForHash()
+					if m.changeFileTab < len(files)-1 {
+						m.changeFileTab++
+						m.changeOffset = 0
+						m.changeHOffset = 0
+					}
+					return m, nil
+				}
 				// changes pane scroll
 				if k == "w" {
 					if m.changeOffset > 0 {
@@ -230,24 +251,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m, nil
 				}
 				if k == "s" {
-					// bound by number of change lines for selected hash
-					sel := ""
-					if len(m.hashes) > 0 && m.hashIndex < len(m.hashes) {
-						sel = m.hashes[m.hashIndex]
-					}
-					if sel != "" {
-						if changes, ok := m.changeMap[sel]; ok {
-							visible := m.topVisibleLines() - 1 // minus title
-							if visible < 1 {
-								visible = 1
-							}
-							maxOff := len(changes) - visible
-							if maxOff < 0 {
-								maxOff = 0
-							}
-							if m.changeOffset < maxOff {
-								m.changeOffset++
-							}
+					// bound by number of change lines for active file tab
+					changes := m.changesForFileTab()
+					if len(changes) > 0 {
+						visible := m.topVisibleLines() - 2 // minus title and tab bar
+						if visible < 1 {
+							visible = 1
+						}
+						maxOff := len(changes) - visible
+						if maxOff < 0 {
+							maxOff = 0
+						}
+						if m.changeOffset < maxOff {
+							m.changeOffset++
 						}
 					}
 					return m, nil
@@ -491,6 +507,8 @@ func (m *model) updateViewportContent() {
 	m.changeOffset = 0
 	m.prOffset = 0
 	m.stagedOffset = 0
+	// auto-select the file tab matching this hash's file
+	m.updateChangeFileTab()
 	// refresh cached staged PRs whenever the visible selection or approvals change
 	m.updateStagedList()
 }
@@ -522,11 +540,26 @@ func (m model) View() string {
 	if topBlockH < 1 {
 		topBlockH = 1
 	}
-	left := lipgloss.NewStyle().Width(leftWidth).Height(topBlockH).Border(lipgloss.NormalBorder()).Padding(1)
-	mid := lipgloss.NewStyle().Width(midWidth).Height(topBlockH).Border(lipgloss.NormalBorder()).Padding(1)
-	// right two columns: pr and staged (staged shows PRs that would be approved)
-	prStyle := lipgloss.NewStyle().Width(prWidth).Height(topBlockH).Border(lipgloss.NormalBorder()).Padding(1)
-	stagedStyle := lipgloss.NewStyle().Width(stagedWidth).Height(topBlockH).Border(lipgloss.NormalBorder()).Padding(1)
+	yellowBorder := lipgloss.NewStyle().BorderForeground(lipgloss.Color("11"))
+	baseCol := func(w int) lipgloss.Style {
+		return lipgloss.NewStyle().Width(w).Height(topBlockH).MaxHeight(topBlockH + 2).Border(lipgloss.NormalBorder()).PaddingLeft(1).PaddingRight(1)
+	}
+	left := baseCol(leftWidth)
+	mid := baseCol(midWidth)
+	prStyle := baseCol(prWidth)
+	stagedStyle := baseCol(stagedWidth)
+	if m.focusRow == 0 {
+		switch m.col {
+		case 0:
+			left = left.Inherit(yellowBorder)
+		case 1:
+			mid = mid.Inherit(yellowBorder)
+		case 2:
+			prStyle = prStyle.Inherit(yellowBorder)
+		case 3:
+			stagedStyle = stagedStyle.Inherit(yellowBorder)
+		}
+	}
 
 	// build column title row
 	titleStyle := lipgloss.NewStyle().Bold(true)
@@ -588,14 +621,26 @@ func (m model) View() string {
 		}
 	}
 
-	// middle column: show changes for selected hash
+	// middle column: show changes for selected hash (with file tabs)
 	var midLines []string
 	midLines = append(midLines, midTitle)
+	// render file tab bar
+	tabBar := m.renderFileTabs(midWidth)
+	if tabBar != "" {
+		midLines = append(midLines, tabBar)
+	}
 	if selectedHash != "" {
-		if changes, ok := m.changeMap[selectedHash]; ok {
-			// build a list of change lines
-			fullChanges := changes
-			visible := m.topVisibleLines()
+		fullChanges := m.changesForFileTab()
+		if len(fullChanges) > 0 {
+			// subtract title + tab bar from visible lines
+			headerLines := 1 // title
+			if tabBar != "" {
+				headerLines = 2 // title + tab bar
+			}
+			visible := m.topVisibleLines() - headerLines
+			if visible < 1 {
+				visible = 1
+			}
 			// clamp changeOffset
 			if m.changeOffset < 0 {
 				m.changeOffset = 0
@@ -636,11 +681,7 @@ func (m model) View() string {
 				if len([]rune(cl)) > m.changeHOffset+contentW {
 					display = display + "»"
 				}
-				if m.col == 1 && m.focusRow == 0 {
-					midLines = append(midLines, lipgloss.NewStyle().Background(lipgloss.Color("62")).Render(display))
-				} else {
-					midLines = append(midLines, display)
-				}
+				midLines = append(midLines, display)
 			}
 		} else {
 			midLines = append(midLines, "(no changes)")
@@ -731,13 +772,16 @@ func (m model) View() string {
 		bottomBlockH = 3
 	}
 	bottomStyle := lipgloss.NewStyle().Height(bottomBlockH).Border(lipgloss.NormalBorder()).Padding(1)
+	if m.focusRow == 1 {
+		bottomStyle = bottomStyle.Inherit(yellowBorder)
+	}
 	bodyView := m.viewport.View()
 	if bodyView == "" {
 		bodyView = "(no PR body)"
 	}
 
 	// footer with keybind hints (bottom-left)
-	hint := "tab: switch row • a/d: left/right • w/s: up/down • x: approve • c: commit • q: quit • f: decline • alt+a/d: hscroll"
+	hint := "tab: switch row • a/d: left/right • w/s: up/down • e/r: file tabs • x: approve • c: commit • q: quit • f: decline • alt+a/d: hscroll"
 	footer := lipgloss.NewStyle().Padding(0, 1).Render(hint)
 
 	bottom := bottomStyle.Render(bodyView)
@@ -899,6 +943,145 @@ func (m model) selectedHash() string {
 		return m.hashes[m.hashIndex]
 	}
 	return ""
+}
+
+// changeFilesForHash returns the sorted list of unique filenames for the
+// selected hash's PR. Returns nil if no file info is available.
+func (m model) changeFilesForHash() []string {
+	sel := m.selectedHash()
+	if sel == "" || len(m.hashFileMap) == 0 {
+		return nil
+	}
+	// find the PR(s) for this hash
+	prs, ok := m.hashPrMap[sel]
+	if !ok || len(prs) == 0 {
+		return nil
+	}
+	prKey := prs[0].GetHTMLURL()
+	prHashes, ok := m.prMap[prKey]
+	if !ok {
+		return nil
+	}
+	seen := map[string]struct{}{}
+	var files []string
+	for _, h := range prHashes {
+		if f, ok := m.hashFileMap[h]; ok && f != "" {
+			if _, dup := seen[f]; !dup {
+				seen[f] = struct{}{}
+				files = append(files, f)
+			}
+		}
+	}
+	sort.Strings(files)
+	return files
+}
+
+// changesForFileTab returns the change lines for the active file tab.
+// It concatenates changes from all hashes in the PR that belong to the
+// selected file, with "---" separators between hunks. Falls back to
+// changeMap[selectedHash] if no file info is available.
+func (m model) changesForFileTab() []string {
+	sel := m.selectedHash()
+	if sel == "" {
+		return nil
+	}
+	files := m.changeFilesForHash()
+	if len(files) == 0 {
+		// no file info — fall back to raw change map
+		return m.changeMap[sel]
+	}
+	tabIdx := m.changeFileTab
+	if tabIdx < 0 || tabIdx >= len(files) {
+		tabIdx = 0
+	}
+	activeFile := files[tabIdx]
+
+	// find the PR key
+	prs, ok := m.hashPrMap[sel]
+	if !ok || len(prs) == 0 {
+		return m.changeMap[sel]
+	}
+	prKey := prs[0].GetHTMLURL()
+	prHashes, ok := m.prMap[prKey]
+	if !ok {
+		return m.changeMap[sel]
+	}
+
+	var result []string
+	first := true
+	for _, h := range prHashes {
+		if m.hashFileMap[h] != activeFile {
+			continue
+		}
+		changes, ok := m.changeMap[h]
+		if !ok || len(changes) == 0 {
+			continue
+		}
+		if !first {
+			result = append(result, "---")
+		}
+		result = append(result, changes...)
+		first = false
+	}
+	return result
+}
+
+// renderFileTabs renders the file tab bar for the changes panel.
+func (m model) renderFileTabs(midWidth int) string {
+	files := m.changeFilesForHash()
+	if len(files) == 0 {
+		return ""
+	}
+	tabIdx := m.changeFileTab
+	if tabIdx < 0 || tabIdx >= len(files) {
+		tabIdx = 0
+	}
+	var parts []string
+	for i, f := range files {
+		// use basename
+		base := f
+		if idx := strings.LastIndex(f, "/"); idx >= 0 {
+			base = f[idx+1:]
+		}
+		if i == tabIdx {
+			parts = append(parts, lipgloss.NewStyle().Bold(true).Background(lipgloss.Color("62")).Render(" "+base+" "))
+		} else {
+			parts = append(parts, " "+base+" ")
+		}
+	}
+	line := strings.Join(parts, "│")
+	// truncate if too wide
+	contentW := midWidth - 4
+	if contentW < 10 {
+		contentW = 10
+	}
+	r := []rune(line)
+	if len(r) > contentW {
+		line = string(r[:contentW-1]) + "»"
+	}
+	return line
+}
+
+// updateChangeFileTab auto-selects the file tab matching the current hash's file.
+func (m *model) updateChangeFileTab() {
+	files := m.changeFilesForHash()
+	if len(files) == 0 {
+		m.changeFileTab = 0
+		return
+	}
+	sel := m.selectedHash()
+	if sel == "" {
+		m.changeFileTab = 0
+		return
+	}
+	currentFile := m.hashFileMap[sel]
+	for i, f := range files {
+		if f == currentFile {
+			m.changeFileTab = i
+			return
+		}
+	}
+	m.changeFileTab = 0
 }
 
 // columnWidths computes the 4-column layout widths (left, mid, pr, staged).
