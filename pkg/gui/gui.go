@@ -56,13 +56,13 @@ type model struct {
 
 	// File tab state for changes panel
 	hashFileMap   gh.HashFileMap // hash → filename
-	changeFileTab int           // index of selected file tab
+	changeFileTab int            // index of selected file tab
 
 	// User selection phase (phase 0) fields
-	availableUsers  []string
-	userSelected    map[string]bool
-	userCursor      int
-	userHashPrMap   gh.GhPrHashMap
+	availableUsers   []string
+	userSelected     map[string]bool
+	userCursor       int
+	userHashPrMap    gh.GhPrHashMap
 	userScrollOffset int
 }
 
@@ -81,28 +81,28 @@ func New(user string, propagate bool, dryRun bool) (*tea.Program, error) {
 	}
 
 	m := model{
-		phase:           phase,
-		hashes:          hashes,
-		changeMap:       changeMap,
-		hashPrMap:       hashPrMap,
-		prMap:           prMap,
-		verifiedMap:     verifiedMap,
-		client:          client,
-		approved:        map[string]bool{},
-		declined:        map[string]bool{},
-		prSkipped:       map[string]bool{},
-		committed:       map[string]bool{},
-		propagate:       propagate,
-		col:             0,
-		dryRun:          dryRun,
-		focusRow:        0,
-		stagedOffset:    0,
-		stagedPRList:    nil,
-		hashFileMap:     hashFileMap,
-		availableUsers:  availableUsers,
-		userSelected:    map[string]bool{},
-		userCursor:      0,
-		userHashPrMap:   userHashPrMap,
+		phase:          phase,
+		hashes:         hashes,
+		changeMap:      changeMap,
+		hashPrMap:      hashPrMap,
+		prMap:          prMap,
+		verifiedMap:    verifiedMap,
+		client:         client,
+		approved:       map[string]bool{},
+		declined:       map[string]bool{},
+		prSkipped:      map[string]bool{},
+		committed:      map[string]bool{},
+		propagate:      propagate,
+		col:            0,
+		dryRun:         dryRun,
+		focusRow:       0,
+		stagedOffset:   0,
+		stagedPRList:   nil,
+		hashFileMap:    hashFileMap,
+		availableUsers: availableUsers,
+		userSelected:   map[string]bool{},
+		userCursor:     0,
+		userHashPrMap:  userHashPrMap,
 	}
 	if phase == 1 {
 		// compute initial staged list so the UI shows consistent state immediately
@@ -945,85 +945,45 @@ func (m model) selectedHash() string {
 	return ""
 }
 
-// changeFilesForHash returns the sorted list of unique filenames for the
-// selected hash's PR. Returns nil if no file info is available.
+// changeFilesForHash returns the unique file paths where the selected hash's
+// change is applied, across all PRs that contain it. Each entry is formatted
+// as "repo#num:file" so you can see which PR/repo each file belongs to.
 func (m model) changeFilesForHash() []string {
 	sel := m.selectedHash()
 	if sel == "" || len(m.hashFileMap) == 0 {
 		return nil
 	}
-	// find the PR(s) for this hash
-	prs, ok := m.hashPrMap[sel]
-	if !ok || len(prs) == 0 {
+	prFiles, ok := m.hashFileMap[sel]
+	if !ok || len(prFiles) == 0 {
 		return nil
 	}
-	prKey := prs[0].GetHTMLURL()
-	prHashes, ok := m.prMap[prKey]
-	if !ok {
-		return nil
-	}
-	seen := map[string]struct{}{}
 	var files []string
-	for _, h := range prHashes {
-		if f, ok := m.hashFileMap[h]; ok && f != "" {
-			if _, dup := seen[f]; !dup {
-				seen[f] = struct{}{}
-				files = append(files, f)
-			}
-		}
+	for prURL, file := range prFiles {
+		// Format as "file (repo#num)" for context
+		label := fmt.Sprintf("%s (%s)", file, shortenPRURL(prURL))
+		files = append(files, label)
 	}
 	sort.Strings(files)
 	return files
 }
 
-// changesForFileTab returns the change lines for the active file tab.
-// It concatenates changes from all hashes in the PR that belong to the
-// selected file, with "---" separators between hunks. Falls back to
-// changeMap[selectedHash] if no file info is available.
+// shortenPRURL turns "https://github.com/owner/repo/pull/123" into "owner/repo#123".
+func shortenPRURL(url string) string {
+	// Expected format: https://github.com/{owner}/{repo}/pull/{number}
+	parts := strings.Split(url, "/")
+	if len(parts) >= 7 {
+		return fmt.Sprintf("%s/%s#%s", parts[3], parts[4], parts[6])
+	}
+	return url
+}
+
+// changesForFileTab returns the change lines for the selected hash.
 func (m model) changesForFileTab() []string {
 	sel := m.selectedHash()
 	if sel == "" {
 		return nil
 	}
-	files := m.changeFilesForHash()
-	if len(files) == 0 {
-		// no file info — fall back to raw change map
-		return m.changeMap[sel]
-	}
-	tabIdx := m.changeFileTab
-	if tabIdx < 0 || tabIdx >= len(files) {
-		tabIdx = 0
-	}
-	activeFile := files[tabIdx]
-
-	// find the PR key
-	prs, ok := m.hashPrMap[sel]
-	if !ok || len(prs) == 0 {
-		return m.changeMap[sel]
-	}
-	prKey := prs[0].GetHTMLURL()
-	prHashes, ok := m.prMap[prKey]
-	if !ok {
-		return m.changeMap[sel]
-	}
-
-	var result []string
-	first := true
-	for _, h := range prHashes {
-		if m.hashFileMap[h] != activeFile {
-			continue
-		}
-		changes, ok := m.changeMap[h]
-		if !ok || len(changes) == 0 {
-			continue
-		}
-		if !first {
-			result = append(result, "---")
-		}
-		result = append(result, changes...)
-		first = false
-	}
-	return result
+	return m.changeMap[sel]
 }
 
 // renderFileTabs renders the file tab bar for the changes panel.
@@ -1038,49 +998,23 @@ func (m model) renderFileTabs(midWidth int) string {
 	}
 	var parts []string
 	for i, f := range files {
-		// use basename
-		base := f
-		if idx := strings.LastIndex(f, "/"); idx >= 0 {
-			base = f[idx+1:]
-		}
 		if i == tabIdx {
-			parts = append(parts, lipgloss.NewStyle().Bold(true).Background(lipgloss.Color("62")).Render(" "+base+" "))
+			parts = append(parts, lipgloss.NewStyle().Bold(true).Background(lipgloss.Color("62")).Render(" "+f+" "))
 		} else {
-			parts = append(parts, " "+base+" ")
+			parts = append(parts, " "+f+" ")
 		}
 	}
 	line := strings.Join(parts, "│")
-	// truncate if too wide
+	// truncate if too wide (use lipgloss for ANSI-safe truncation)
 	contentW := midWidth - 4
 	if contentW < 10 {
 		contentW = 10
 	}
-	r := []rune(line)
-	if len(r) > contentW {
-		line = string(r[:contentW-1]) + "»"
-	}
-	return line
+	return lipgloss.NewStyle().MaxWidth(contentW).Render(line)
 }
 
-// updateChangeFileTab auto-selects the file tab matching the current hash's file.
+// updateChangeFileTab resets the file tab to the first entry when the hash changes.
 func (m *model) updateChangeFileTab() {
-	files := m.changeFilesForHash()
-	if len(files) == 0 {
-		m.changeFileTab = 0
-		return
-	}
-	sel := m.selectedHash()
-	if sel == "" {
-		m.changeFileTab = 0
-		return
-	}
-	currentFile := m.hashFileMap[sel]
-	for i, f := range files {
-		if f == currentFile {
-			m.changeFileTab = i
-			return
-		}
-	}
 	m.changeFileTab = 0
 }
 

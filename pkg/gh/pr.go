@@ -152,10 +152,11 @@ func (g *GhClient) GetPrReviewRequested() (GhPrHashMap, HashChangeMap, HashPrMap
 					hashChangeMap[k] = v
 				}
 			}
-			for k, v := range localFileMap {
-				if _, ok := hashFileMap[k]; !ok {
-					hashFileMap[k] = v
+			for h, file := range localFileMap {
+				if hashFileMap[h] == nil {
+					hashFileMap[h] = make(map[string]string)
 				}
+				hashFileMap[h][prKey] = file
 			}
 			mu.Unlock()
 			return nil
