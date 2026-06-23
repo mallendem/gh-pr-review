@@ -24,8 +24,14 @@ type PrHashMap map[string][]string
 // PrVerifiedMap maps a PR identifier (HTML URL) to whether all its commits are verified (signed)
 type PrVerifiedMap map[string]bool
 
-// HashFileMap maps hash strings to the filename the hunk belongs to
-type HashFileMap map[string]string
+// HashFileMap maps hash strings to a map of PR URL → filename, so the same
+// hash can track different file locations across different PRs/repos.
+type HashFileMap map[string]map[string]string
+
+// HashRawChangeMap stores the raw (unfiltered) hunk lines per hash, including
+// context lines, additions and deletions — used for rendering diffs with
+// surrounding context in the GUI.
+type HashRawChangeMap map[string][]string
 
 func (g *GhClient) getNotifications() ([]*github.Notification, error) {
 	var allNotifications []*github.Notification

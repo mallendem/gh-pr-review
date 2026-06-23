@@ -32,7 +32,7 @@ func ApprovePullRequest(users []string) error {
 
 func PrintUsersWithPrs() {
 	g := gh.NewGhClient()
-	userHashPrMap, _, _, _, _, _, err := g.GetPrReviewRequested()
+	userHashPrMap, _, _, _, _, _, _, err := g.GetPrReviewRequested()
 	if err != nil {
 		fmt.Println(colorize(cYellow, fmt.Sprintf("Error fetching PR review requests: %v", err)))
 		return
@@ -49,7 +49,7 @@ func PrintUsersWithPrs() {
 
 func ApprovePrByHash(hashes []string) {
 	g := gh.NewGhClient()
-	_, changeMap, hMap, prMap, _, _, err := g.GetPrReviewRequested()
+	_, changeMap, hMap, prMap, _, _, _, err := g.GetPrReviewRequested()
 	if err != nil {
 		fmt.Println(colorize(cYellow, fmt.Sprintf("Error fetching PR review requests: %v", err)))
 		return
@@ -94,7 +94,7 @@ func ApprovePrByHash(hashes []string) {
 // skips actual GitHub API calls.
 func ManualApproval(user string, propagate bool, dryRun bool) error {
 	g := gh.NewGhClient()
-	userHashPrMap, changeMap, hashPrMap, prMap, verifiedMap, _, err := g.GetPrReviewRequested()
+	userHashPrMap, changeMap, hashPrMap, prMap, verifiedMap, _, _, err := g.GetPrReviewRequested()
 	if err != nil {
 		return fmt.Errorf("error fetching PR review requests: %w", err)
 	}
@@ -154,7 +154,9 @@ func ManualApproval(user string, propagate bool, dryRun bool) error {
 		promptActionForHash(h, idx, total, prProgressIndex, totalPRs, in, g, propagate, approved, declined, prSkipped, hashPrMap, prMap)
 	}
 
-	ProcessApprovals(prMap, approved, declined, prSkipped, hashPrMap, g, dryRun)
+	for _, line := range ProcessApprovals(prMap, approved, declined, prSkipped, hashPrMap, g, dryRun, "") {
+		fmt.Println(line)
+	}
 	return nil
 }
 
@@ -333,11 +335,21 @@ func showPrComments(h string, hashPrMap gh.HashPrMap, g *gh.GhClient) {
 }
 
 // ProcessApprovals walks prMap and approves PRs where all hashes are approved.
-func ProcessApprovals(prMap map[string][]string, approved, declined, prSkipped map[string]bool, hashPrMap gh.HashPrMap, g *gh.GhClient, dryRun bool) {
-	for prKey, phashes := range prMap {
+// It returns a slice of log lines (already colorized) so callers can display
+// them however they like (print to stdout for CLI, show in popup for GUI).
+func ProcessApprovals(prMap map[string][]string, approved, declined, prSkipped map[string]bool, hashPrMap gh.HashPrMap, g *gh.GhClient, dryRun bool, reviewBody string) []string {
+	var logs []string
+	// Sort keys for deterministic output.
+	var prKeys []string
+	for k := range prMap {
+		prKeys = append(prKeys, k)
+	}
+	sort.Strings(prKeys)
+	for _, prKey := range prKeys {
+		phashes := prMap[prKey]
 		if len(phashes) == 0 || prSkipped[prKey] {
 			if prSkipped[prKey] {
-				fmt.Println(colorize(cYellow, fmt.Sprintf("Not approving PR %s (skipped due to a declined hash)", prKey)))
+				logs = append(logs, colorize(cYellow, fmt.Sprintf("Not approving PR %s (skipped due to a declined hash)", prKey)))
 			}
 			continue
 		}
@@ -346,17 +358,18 @@ func ProcessApprovals(prMap map[string][]string, approved, declined, prSkipped m
 		}
 		pr := findPrByURL(prKey, hashPrMap)
 		if pr == nil {
-			fmt.Println(colorize(cRed, fmt.Sprintf("Could not find PR object for %s to approve", prKey)))
+			logs = append(logs, colorize(cRed, fmt.Sprintf("Could not find PR object for %s to approve", prKey)))
 			continue
 		}
 		if dryRun {
-			fmt.Println(colorize(cYellow, fmt.Sprintf("[dry-run] Would approve PR %s", prKey)))
-		} else if err := g.ApprovePr(pr); err != nil {
-			fmt.Println(colorize(cRed, fmt.Sprintf("Failed to approve PR %s: %v", prKey, err)))
+			logs = append(logs, colorize(cYellow, fmt.Sprintf("[dry-run] Would approve PR %s", prKey)))
+		} else if err := g.ApprovePr(pr, reviewBody); err != nil {
+			logs = append(logs, colorize(cRed, fmt.Sprintf("Failed to approve PR %s: %v", prKey, err)))
 		} else {
-			fmt.Println(colorize(cGreen, fmt.Sprintf("Approved PR %s", prKey)))
+			logs = append(logs, colorize(cGreen, fmt.Sprintf("Approved PR %s", prKey)))
 		}
 	}
+	return logs
 }
 
 func allHashesApproved(phashes []string, approved, declined map[string]bool) bool {
@@ -438,11 +451,11 @@ func DeclineLinkedHashes(h string, declined, prSkipped map[string]bool, hashPrMa
 // PrepareGUI fetches data and, if user is empty, returns the list of available
 // usernames so a selection panel can be shown. When user is non-empty it behaves
 // like PrepareManualApproval and pre-filters hashes for that user.
-func PrepareGUI(user string) (hashes []string, availableUsers []string, userHashPrMap gh.GhPrHashMap, changeMap gh.HashChangeMap, hashPrMap gh.HashPrMap, prMap map[string][]string, verifiedMap gh.PrVerifiedMap, hashFileMap gh.HashFileMap, client *gh.GhClient, err error) {
+func PrepareGUI(user string) (hashes []string, availableUsers []string, userHashPrMap gh.GhPrHashMap, changeMap gh.HashChangeMap, hashPrMap gh.HashPrMap, prMap map[string][]string, verifiedMap gh.PrVerifiedMap, hashFileMap gh.HashFileMap, rawChangeMap gh.HashRawChangeMap, client *gh.GhClient, err error) {
 	client = gh.NewGhClient()
-	userHashPrMap, changeMap, hashPrMap, prMap, verifiedMap, hashFileMap, err = client.GetPrReviewRequested()
+	userHashPrMap, changeMap, hashPrMap, prMap, verifiedMap, hashFileMap, rawChangeMap, err = client.GetPrReviewRequested()
 	if err != nil {
-		return nil, nil, nil, nil, nil, nil, nil, nil, nil, fmt.Errorf("error fetching PR review requests: %w", err)
+		return nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, fmt.Errorf("error fetching PR review requests: %w", err)
 	}
 	// build sorted list of available users
 	for u := range userHashPrMap {
@@ -465,7 +478,7 @@ func CollectHashesForUsers(user string, userHashPrMap gh.GhPrHashMap) []string {
 // PrepareManualApproval fetches data required for manual approval (used by both CLI and GUI).
 func PrepareManualApproval(user string) ([]string, gh.HashChangeMap, gh.HashPrMap, map[string][]string, gh.PrVerifiedMap, *gh.GhClient, error) {
 	g := gh.NewGhClient()
-	userHashPrMap, changeMap, hashPrMap, prMap, verifiedMap, _, err := g.GetPrReviewRequested()
+	userHashPrMap, changeMap, hashPrMap, prMap, verifiedMap, _, _, err := g.GetPrReviewRequested()
 	if err != nil {
 		return nil, nil, nil, nil, nil, nil, fmt.Errorf("error fetching PR review requests: %w", err)
 	}
