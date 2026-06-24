@@ -2,6 +2,72 @@ package gh
 
 import "testing"
 
+func TestNormalizeHunkLine(t *testing.T) {
+	tests := []struct {
+		name     string
+		line     string
+		filename string
+		want     string
+	}{
+		{
+			name:     "yaml strips leading whitespace and list marker",
+			line:     "-      - uses: actions/checkout@v6",
+			filename: ".github/workflows/ci.yml",
+			want:     "-uses: actions/checkout@v6",
+		},
+		{
+			name:     "yaml without list marker collapses to same as with marker",
+			line:     "-        uses: actions/checkout@v6",
+			filename: ".github/workflows/ci.yml",
+			want:     "-uses: actions/checkout@v6",
+		},
+		{
+			name:     "yaml addition strips list marker",
+			line:     "+      - uses: actions/checkout@v7",
+			filename: "deploy.yaml",
+			want:     "+uses: actions/checkout@v7",
+		},
+		{
+			name:     "non-yaml keeps list marker, only strips whitespace",
+			line:     "-      - uses: actions/checkout@v6",
+			filename: "README.md",
+			want:     "-- uses: actions/checkout@v6",
+		},
+		{
+			name:     "yaml only strips a single list marker",
+			line:     "-   - - nested",
+			filename: "config.yml",
+			want:     "-- nested",
+		},
+		{
+			name:     "yaml line without marker just strips whitespace",
+			line:     "+    name: build",
+			filename: "ci.yaml",
+			want:     "+name: build",
+		},
+		{
+			name:     "yaml strips tab-separated list marker",
+			line:     "-\t-\tuses: actions/checkout@v6",
+			filename: "ci.yml",
+			want:     "-uses: actions/checkout@v6",
+		},
+		{
+			name:     "uppercase yaml extension is treated as yaml",
+			line:     "-      - uses: actions/checkout@v6",
+			filename: "CI.YML",
+			want:     "-uses: actions/checkout@v6",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := normalizeHunkLine(tt.line, tt.filename); got != tt.want {
+				t.Fatalf("normalizeHunkLine(%q, %q) = %q, want %q", tt.line, tt.filename, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestRemoveDependabotTrailingCommand(t *testing.T) {
 	input := `Some description of the PR.
 

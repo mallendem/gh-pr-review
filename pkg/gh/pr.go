@@ -81,10 +81,7 @@ func (g *GhClient) getPrHash(pr *github.PullRequest) ([]string, map[string][]str
 			// Capture all lines (context, additions, deletions) into rawHunkLines
 			rawHunkLines = append(rawHunkLines, line)
 			if strings.HasPrefix(line, "+") || strings.HasPrefix(line, "-") {
-				// Strip leading whitespace after the +/- prefix so indentation
-				// differences don't produce different hashes.
-				normalized := line[:1] + strings.TrimLeft(line[1:], " \t")
-				hunkLines = append(hunkLines, normalized)
+				hunkLines = append(hunkLines, normalizeHunkLine(line, currentFile))
 			}
 		}
 	}

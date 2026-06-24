@@ -2,6 +2,31 @@ package gh
 
 import "strings"
 
+// normalizeHunkLine normalizes a diff line (prefixed with + or -) so that
+// cosmetic differences don't produce different hashes. Leading whitespace after
+// the +/- marker is always stripped. For YAML files, a single leading "- " YAML
+// sequence marker is also stripped, so the same change hashes identically
+// whether or not it sits on a list-item line (e.g. "      - uses: x" vs
+// "        uses: x").
+func normalizeHunkLine(line, filename string) string {
+	content := strings.TrimLeft(line[1:], " \t")
+	if isYAMLFile(filename) {
+		// Strip a single leading YAML sequence marker ("-" followed by
+		// whitespace) so list-item and non-list-item forms hash alike.
+		if rest, ok := strings.CutPrefix(content, "-"); ok {
+			if trimmed := strings.TrimLeft(rest, " \t"); trimmed != rest {
+				content = trimmed
+			}
+		}
+	}
+	return line[:1] + content
+}
+
+func isYAMLFile(filename string) bool {
+	lower := strings.ToLower(filename)
+	return strings.HasSuffix(lower, ".yml") || strings.HasSuffix(lower, ".yaml")
+}
+
 func cleanDependabotMessage(input string) string {
 	withoutHtml := removeHtmlTags(input)
 	cleaned := removeDependabotTrailingCommand(withoutHtml)
