@@ -220,24 +220,28 @@ func (g *GhClient) areCommitsVerified(pr *github.PullRequest) bool {
 }
 
 // ApprovePr updates the PR's branch if needed, approves it and enables
-// auto-merge. It returns progress lines for the caller to display: the GUI owns
-// the terminal, so nothing here may write to stdout.
-func (g *GhClient) ApprovePr(pr *github.PullRequest, reviewBody string) ([]string, error) {
+// auto-merge. Progress is reported through emit as each step finishes rather
+// than returned in a batch, so a caller driving a UI can show the work as it
+// happens: every step here is a network round trip. emit may be nil. Nothing
+// here may write to stdout — the GUI owns the terminal.
+func (g *GhClient) ApprovePr(pr *github.PullRequest, reviewBody string, emit func(string)) error {
+	logf := func(format string, args ...any) {
+		if emit != nil {
+			emit(fmt.Sprintf(format, args...))
+		}
+	}
+
 	if pr == nil {
-		return nil, fmt.Errorf("nil PR")
+		return fmt.Errorf("nil PR")
 	}
 
 	base := pr.GetBase()
 	if base == nil || base.GetRepo() == nil || base.GetRepo().GetOwner() == nil {
-		return nil, fmt.Errorf("unable to determine owner/repo for PR %s", pr.GetHTMLURL())
+		return fmt.Errorf("unable to determine owner/repo for PR %s", pr.GetHTMLURL())
 	}
 	owner := base.GetRepo().GetOwner().GetLogin()
 	repo := base.GetRepo().GetName()
 	number := pr.GetNumber()
-	var logs []string
-	logf := func(format string, args ...any) {
-		logs = append(logs, fmt.Sprintf(format, args...))
-	}
 
 	// 1) Rebase the branch, but only if it is actually behind the base.
 	baseRef := base.GetRef()
@@ -266,25 +270,25 @@ func (g *GhClient) ApprovePr(pr *github.PullRequest, reviewBody string) ([]strin
 		review.Body = &reviewBody
 	}
 	if _, _, err := g.c.PullRequests.CreateReview(context.Background(), owner, repo, number, review); err != nil {
-		return logs, fmt.Errorf("failed to create approval for PR %s: %w", pr.GetHTMLURL(), err)
+		return fmt.Errorf("failed to create approval for PR %s: %w", pr.GetHTMLURL(), err)
 	}
 
 	// 3) Enable auto-merge, falling back to an immediate squash merge.
 	nodeID := pr.GetNodeID()
 	if nodeID == "" {
-		return logs, fmt.Errorf("PR %s has no node ID, cant enable auto-merge", pr.GetHTMLURL())
+		return fmt.Errorf("PR %s has no node ID, cant enable auto-merge", pr.GetHTMLURL())
 	}
 	if err := g.tryEnableAutoMerge(nodeID, pr); err != nil {
 		logf("warning: enabling auto-merge failed for PR %s: %v; attempting squash merge", pr.GetHTMLURL(), err)
 		if mergeErr := g.trySquashMerge(owner, repo, number, pr); mergeErr != nil {
-			return logs, fmt.Errorf("squash merge failed for PR %s: %v; original auto-merge error: %w", pr.GetHTMLURL(), mergeErr, err)
+			return fmt.Errorf("squash merge failed for PR %s: %v; original auto-merge error: %w", pr.GetHTMLURL(), mergeErr, err)
 		}
 		logf("squash merged PR %s", pr.GetHTMLURL())
 	} else {
 		logf("enabled auto-merge (GraphQL) for PR %s", pr.GetHTMLURL())
 	}
 
-	return logs, nil
+	return nil
 }
 
 // tryEnableAutoMerge attempts to enable auto-merge for the given PR using GraphQL.

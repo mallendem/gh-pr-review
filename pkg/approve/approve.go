@@ -231,9 +231,7 @@ func ManualApproval(user string, propagate bool, dryRun bool) error {
 		promptActionForHash(h, idx, total, prProgressIndex, totalPRs, in, propagate, dec, set)
 	}
 
-	for _, line := range ProcessApprovals(set, dec, g, dryRun, "") {
-		fmt.Println(line)
-	}
+	ProcessApprovals(set, dec, g, dryRun, "", func(line string) { fmt.Println(line) })
 	return nil
 }
 
@@ -409,11 +407,15 @@ func showPrComments(h string, hashPRs gh.HashPrMap) {
 	}
 }
 
-// ProcessApprovals approves every PR whose hashes are all approved. It returns
-// colorized log lines so callers can print them (CLI) or show them in a popup
-// (GUI) — nothing here writes to stdout.
-func ProcessApprovals(set *gh.ReviewSet, dec Decisions, g *gh.GhClient, dryRun bool, reviewBody string) []string {
-	var logs []string
+// ProcessApprovals approves every PR whose hashes are all approved. Colorized
+// progress goes to emit as it happens rather than in a batch at the end: each
+// PR costs several network round trips, so a caller that batches would show
+// nothing at all until the last one lands. Nothing here writes to stdout.
+func ProcessApprovals(set *gh.ReviewSet, dec Decisions, g *gh.GhClient, dryRun bool, reviewBody string, emit func(string)) {
+	if emit == nil {
+		emit = func(string) {}
+	}
+
 	var prKeys []string
 	for k := range set.PRHashes {
 		prKeys = append(prKeys, k)
@@ -423,7 +425,7 @@ func ProcessApprovals(set *gh.ReviewSet, dec Decisions, g *gh.GhClient, dryRun b
 	for _, prKey := range prKeys {
 		hashes := set.PRHashes[prKey]
 		if dec.Skipped[prKey] {
-			logs = append(logs, colorize(cYellow, fmt.Sprintf("Not approving PR %s (skipped due to a declined hash)", prKey)))
+			emit(colorize(cYellow, fmt.Sprintf("Not approving PR %s (skipped due to a declined hash)", prKey)))
 			continue
 		}
 		if !dec.PrApproved(hashes) {
@@ -431,24 +433,23 @@ func ProcessApprovals(set *gh.ReviewSet, dec Decisions, g *gh.GhClient, dryRun b
 		}
 		pr := findPrByURL(prKey, set.HashPRs)
 		if pr == nil {
-			logs = append(logs, colorize(cRed, fmt.Sprintf("Could not find PR object for %s to approve", prKey)))
+			emit(colorize(cRed, fmt.Sprintf("Could not find PR object for %s to approve", prKey)))
 			continue
 		}
 		if dryRun {
-			logs = append(logs, colorize(cYellow, fmt.Sprintf("[dry-run] Would approve PR %s", prKey)))
+			emit(colorize(cYellow, fmt.Sprintf("[dry-run] Would approve PR %s", prKey)))
 			continue
 		}
-		steps, err := g.ApprovePr(pr, reviewBody)
-		for _, s := range steps {
-			logs = append(logs, colorize(cCyan, "  "+s))
-		}
+		emit(colorize(cCyan, fmt.Sprintf("Approving PR %s ...", prKey)))
+		err := g.ApprovePr(pr, reviewBody, func(step string) {
+			emit(colorize(cCyan, "  "+step))
+		})
 		if err != nil {
-			logs = append(logs, colorize(cRed, fmt.Sprintf("Failed to approve PR %s: %v", prKey, err)))
+			emit(colorize(cRed, fmt.Sprintf("Failed to approve PR %s: %v", prKey, err)))
 		} else {
-			logs = append(logs, colorize(cGreen, fmt.Sprintf("Approved PR %s", prKey)))
+			emit(colorize(cGreen, fmt.Sprintf("Approved PR %s", prKey)))
 		}
 	}
-	return logs
 }
 
 func findPrByURL(url string, hashPRs gh.HashPrMap) *github.PullRequest {
