@@ -45,19 +45,21 @@ pr-approver approve gui --user alice --propagate --dry-run
 |---|---|
 | `a` / `d` | Move focus left / right between columns |
 | `w` / `s` | Scroll up / down in the focused column |
+| `pgup` / `pgdown` | Page up / down in the focused column |
 | `tab` | Switch focus between top row and PR body |
-| `e` / `r` | Previous / next file tab |
+| `e` / `r` | Previous / next occurrence tab in the changes column |
 | `alt+a` / `alt+d` | Horizontal scroll in changes column |
 | `x` | Approve selected hash |
 | `f` | Decline selected hash |
 | `c` | Commit (approve staged PRs) — shows confirmation dialog |
 | `p` | Open settings panel |
+| `l` | Show the log popup (fetch warnings, approval progress) |
 | `q` / `esc` | Quit |
 
 #### GUI columns
 
 1. **Hashes** — content hashes with approval status (checkmark/x)
-2. **Changes** — diff view with syntax coloring (`+` green, `-` red) and configurable context lines
+2. **Changes** — diff view with syntax coloring (`+` green, `-` red) and configurable context lines. One tab per occurrence of the hash, since the same change usually appears in several files and PRs
 3. **Related PRs** — PRs associated with the selected hash, with linked hash tree view
 4. **Staged changes** — PRs that are fully approved and ready to commit
 
@@ -101,7 +103,7 @@ Supported keys:
 | `review_comment` | `This change has been reviewed by a human with a batch tool.` | Body text for the approval review |
 | `context_lines` | `10` | Number of unchanged lines shown around each change in the diff view |
 
-Settings edited in the GUI take effect immediately but are not persisted to the file. To make settings permanent, edit `~/.gh-pr-approver`.
+Settings edited in the GUI take effect immediately and are written back to `~/.gh-pr-approver`.
 
 ## Flags
 
@@ -116,7 +118,7 @@ Settings edited in the GUI take effect immediately but are not persisted to the 
 ## How it works
 
 1. Fetches your GitHub notifications filtered to `review_requested`
-2. For each PR, downloads the diff and splits it into hunks
-3. Each hunk is normalized (whitespace-stripped) and SHA-256 hashed
-4. Identical changes across PRs share the same hash — review once, approve everywhere
+2. For each PR, downloads the diff and splits every hunk into change blocks — consecutive runs of `+`/`-` lines
+3. Each block is normalized (whitespace-stripped, YAML list markers folded) and SHA-256 hashed
+4. Identical changes across PRs share the same hash — review once, approve everywhere. Blocks rather than whole hunks are hashed because git merges hunks whose changes are a few lines apart, which would otherwise give the same logical change a different hash depending on what happens to sit next to it
 5. When you approve all hashes for a PR, it can be committed: the tool creates an approval review, attempts to rebase the branch, and enables auto-merge (falling back to squash merge)
