@@ -234,6 +234,79 @@ func TestStagedPRsRequireEveryHashApproved(t *testing.T) {
 	}
 }
 
+// Committing must not block the event loop: the popup opens empty and fills in
+// line by line as the approvals land.
+func TestCommitStreamsLogLines(t *testing.T) {
+	m := testModel(120, 40)
+	m.resize(120, 40)
+	m.dryRun = true // no client, no network
+	for _, h := range m.hashes {
+		m.dec.Approve(h)
+	}
+	staged := len(m.stagedPRs())
+	if staged == 0 {
+		t.Fatal("nothing staged to commit")
+	}
+
+	m.updateReview("c")
+	cmd := m.updateConfirmation("y")
+	if cmd == nil {
+		t.Fatal("y returned no command, so nothing would ever run")
+	}
+	if !m.committing {
+		t.Error("commit not marked in progress")
+	}
+	if !m.showLog {
+		t.Error("log popup should open before the first approval, not after the last")
+	}
+	if len(m.logLines) != 0 {
+		t.Errorf("log was pre-filled with %d lines instead of streaming", len(m.logLines))
+	}
+
+	// Drive the loop the way Bubble Tea would, one message at a time.
+	lineCounts := []int{}
+	for range 200 {
+		msg := cmd()
+		if msg == nil {
+			break
+		}
+		_, cmd = m.Update(msg)
+		lineCounts = append(lineCounts, len(m.logLines))
+		if cmd == nil {
+			break
+		}
+	}
+
+	if len(lineCounts) < 2 || lineCounts[0] != 1 {
+		t.Errorf("lines did not arrive incrementally: %v", lineCounts)
+	}
+	if m.committing {
+		t.Error("still marked committing after the done message")
+	}
+	if len(m.logLines) != staged {
+		t.Errorf("got %d log lines for %d staged PRs", len(m.logLines), staged)
+	}
+	for _, h := range m.hashes {
+		if !m.dec.Committed[h] {
+			t.Fatalf("hash %s not marked committed", h)
+		}
+	}
+}
+
+func TestApprovalKeysInertWhileCommitting(t *testing.T) {
+	m := testModel(120, 40)
+	m.committing = true
+	before := len(m.dec.Approved)
+	m.updateReview("x")
+	m.updateReview("f")
+	if len(m.dec.Approved) != before {
+		t.Error("approval keys mutated decisions while the commit goroutine was reading them")
+	}
+	if m.confirmCommit {
+		t.Error("c opened a second commit while one was already running")
+	}
+}
+
 func TestFilterContextLines(t *testing.T) {
 	lines := []string{"a", "b", "c", "d", "-e", "+f", "g", "h", "i", "j"}
 

@@ -66,6 +66,13 @@ type model struct {
 
 	confirmCommit bool
 
+	// Commit runs on a goroutine and streams its progress back over commitCh:
+	// every approval is several network round trips, and doing them inline
+	// would freeze the UI until the last one finished.
+	commitCh      chan tea.Msg
+	committing    bool
+	committingPRs []string
+
 	// Scrollable log popup, reused for commit results and fetch warnings.
 	showLog   bool
 	logTitle  string
@@ -129,6 +136,14 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.resize(msg.Width, msg.Height)
 		return m, nil
 
+	case commitLogMsg:
+		m.appendLog(string(msg))
+		return m, waitForCommitMsg(m.commitCh)
+
+	case commitDoneMsg:
+		m.finishCommit()
+		return m, waitForCommitMsg(m.commitCh)
+
 	case tea.KeyMsg:
 		if msg.Type == tea.KeyCtrlC {
 			return m, tea.Quit
@@ -144,8 +159,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.updateLog(msg.String())
 			return m, nil
 		case m.confirmCommit:
-			m.updateConfirmation(msg.String())
-			return m, nil
+			return m, m.updateConfirmation(msg.String())
 		default:
 			return m, m.updateReview(msg.String())
 		}
@@ -303,6 +317,16 @@ func shortHash(h string) string {
 // --- Review phase input ---
 
 func (m *model) updateReview(k string) tea.Cmd {
+	// The commit goroutine is reading the decisions; don't let a keypress
+	// mutate them underneath it.
+	if m.committing {
+		switch k {
+		case "x", "f", "c":
+			m.status = "commit in progress"
+			return nil
+		}
+	}
+
 	switch k {
 	case "q", "esc":
 		return tea.Quit
@@ -857,29 +881,73 @@ func (m *model) viewSettings() string {
 
 // --- Confirmation dialog ---
 
-func (m *model) updateConfirmation(k string) {
+func (m *model) updateConfirmation(k string) tea.Cmd {
 	switch k {
 	case "y":
-		m.commit()
+		return m.commit()
 	case "n", "esc":
 		m.confirmCommit = false
 		m.status = "commit cancelled"
 	}
+	return nil
 }
 
-func (m *model) commit() {
-	staged := m.stagedPRs()
-	logs := approve.ProcessApprovals(m.set, m.dec, m.client, m.dryRun, m.settings.reviewComment)
-	for _, prKey := range staged {
+// commit starts the approvals on a goroutine and opens the log popup straight
+// away, so the first line appears before the first API call returns.
+func (m *model) commit() tea.Cmd {
+	m.committingPRs = m.stagedPRs()
+	m.confirmCommit = false
+	m.committing = true
+	m.status = fmt.Sprintf("committing %d PR(s)...", len(m.committingPRs))
+
+	m.logTitle = "Commit log"
+	m.logLines = nil
+	m.logOffset = 0
+	m.showLog = true
+
+	// The goroutine only reads the review set and decisions; the review keys
+	// that would mutate them are ignored while committing.
+	ch := make(chan tea.Msg, 64)
+	m.commitCh = ch
+	set, dec, client := m.set, m.dec, m.client
+	dryRun, reviewBody := m.dryRun, m.settings.reviewComment
+	go func() {
+		defer close(ch)
+		approve.ProcessApprovals(set, dec, client, dryRun, reviewBody, func(line string) {
+			ch <- commitLogMsg(line)
+		})
+		ch <- commitDoneMsg{}
+	}()
+	return waitForCommitMsg(ch)
+}
+
+// commitLogMsg is one streamed progress line; commitDoneMsg ends the run.
+type commitLogMsg string
+
+type commitDoneMsg struct{}
+
+func waitForCommitMsg(ch chan tea.Msg) tea.Cmd {
+	return func() tea.Msg {
+		msg, ok := <-ch
+		if !ok {
+			return nil
+		}
+		return msg
+	}
+}
+
+// finishCommit records what was approved once the goroutine is done.
+func (m *model) finishCommit() {
+	for _, prKey := range m.committingPRs {
 		for _, h := range m.set.PRHashes[prKey] {
 			m.dec.Committed[h] = true
 		}
 	}
 	m.reconcileSkipped()
-	m.confirmCommit = false
-	m.status = fmt.Sprintf("committed %d PR(s)", len(staged))
+	m.committing = false
+	m.status = fmt.Sprintf("committed %d PR(s)", len(m.committingPRs))
+	m.committingPRs = nil
 	m.refreshBody()
-	m.openLog("Commit log", logs)
 }
 
 func (m *model) viewConfirmation() string {
@@ -908,6 +976,16 @@ func (m *model) viewConfirmation() string {
 }
 
 // --- Log popup ---
+
+// appendLog adds a streamed line, following the tail unless the reader has
+// scrolled up to look at something.
+func (m *model) appendLog(line string) {
+	atTail := m.logOffset >= max(len(m.logLines)-m.logVisibleLines(), 0)
+	m.logLines = append(m.logLines, line)
+	if atTail {
+		m.logOffset = max(len(m.logLines)-m.logVisibleLines(), 0)
+	}
+}
 
 func (m *model) openLog(title string, lines []string) {
 	if len(lines) == 0 {
@@ -964,9 +1042,13 @@ func (m *model) viewLog() string {
 		Padding(0, 1).
 		Render(strings.Join(rows, "\n"))
 
+	title := m.logTitle
+	if m.committing {
+		title += " (running)"
+	}
 	return lipgloss.JoinVertical(lipgloss.Left,
 		titleStyle.Render(fmt.Sprintf("%s (%d/%d lines) — w/s: scroll • enter/q: close",
-			m.logTitle, min(offset+visible, len(m.logLines)), len(m.logLines))),
+			title, min(offset+visible, len(m.logLines)), len(m.logLines))),
 		panel)
 }
 
