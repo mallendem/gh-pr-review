@@ -115,6 +115,47 @@ func TestParseDiffKeepsSurroundingContext(t *testing.T) {
 	}
 }
 
+// A block's context must stop at its neighbours. Running past them made the
+// changes pane show two unrelated bumps for a hash that only covers one.
+func TestParseDiffContextStopsAtNeighbouringBlocks(t *testing.T) {
+	diff := `diff --git a/ci.yml b/ci.yml
+@@ -10,12 +10,12 @@ jobs:
+     steps:
+-      - uses: actions/setup-go@v5
++      - uses: actions/setup-go@v7
+         with:
+           go-version-file: .go-version
+-      - uses: magefile/mage-action@v3
++      - uses: magefile/mage-action@v4
+         with:
+           install-only: true
+`
+	blocks := parseDiff(diff)
+	if len(blocks) != 2 {
+		t.Fatalf("expected 2 blocks, got %d", len(blocks))
+	}
+
+	first := strings.Join(blocks[0].raw, "\n")
+	if strings.Contains(first, "mage-action@v4") {
+		t.Errorf("block 0 context swallowed the next block's change:\n%s", first)
+	}
+	if !strings.Contains(first, "setup-go@v7") || !strings.Contains(first, "go-version-file") {
+		t.Errorf("block 0 lost its own change or context:\n%s", first)
+	}
+
+	second := strings.Join(blocks[1].raw, "\n")
+	if strings.Contains(second, "setup-go@v5") {
+		t.Errorf("block 1 context swallowed the previous block's change:\n%s", second)
+	}
+	if !strings.Contains(second, "mage-action@v4") || !strings.Contains(second, "install-only") {
+		t.Errorf("block 1 lost its own change or context:\n%s", second)
+	}
+	// The context between the two blocks belongs to both.
+	if !strings.Contains(second, "go-version-file") {
+		t.Errorf("block 1 lost the context leading up to it:\n%s", second)
+	}
+}
+
 func TestParseDiffIgnoresLinesOutsideHunks(t *testing.T) {
 	// "--- a/x" and "+++ b/x" precede the hunk header and must not be mistaken
 	// for change lines.
