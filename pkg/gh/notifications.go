@@ -2,6 +2,7 @@ package gh
 
 import (
 	"context"
+	"sort"
 	"time"
 
 	"github.com/google/go-github/v72/github"
@@ -24,14 +25,60 @@ type PrHashMap map[string][]string
 // PrVerifiedMap maps a PR identifier (HTML URL) to whether all its commits are verified (signed)
 type PrVerifiedMap map[string]bool
 
-// HashFileMap maps hash strings to a map of PR URL → filename, so the same
-// hash can track different file locations across different PRs/repos.
-type HashFileMap map[string]map[string]string
+// Occurrence is one place a hash's change block shows up: a specific spot in a
+// specific file of a specific PR. The same hash usually has many occurrences —
+// that is the whole point of hashing changes by content.
+type Occurrence struct {
+	PrURL string
+	File  string
+	// Raw holds the change block together with the surrounding context lines
+	// from its hunk, so the GUI can render the diff in situ.
+	Raw []string
+}
 
-// HashRawChangeMap stores the raw (unfiltered) hunk lines per hash, including
-// context lines, additions and deletions — used for rendering diffs with
-// surrounding context in the GUI.
-type HashRawChangeMap map[string][]string
+// HashOccurrences maps a hash to every place it appears, sorted by file then PR.
+type HashOccurrences map[string][]Occurrence
+
+// ReviewSet is everything fetched for a review session. It is built once by
+// GetPrReviewRequested and then read by the CLI and the GUI.
+type ReviewSet struct {
+	// UsersToHashes maps a PR author to the hashes contributed by their PRs.
+	UsersToHashes GhPrHashMap
+	// Changes maps a hash to its normalized change lines (the hashed content).
+	Changes HashChangeMap
+	// HashPRs maps a hash to the PRs containing it.
+	HashPRs HashPrMap
+	// PRHashes maps a PR URL to every hash it contains.
+	PRHashes PrHashMap
+	// Verified maps a PR URL to whether all of its commits are signed.
+	Verified PrVerifiedMap
+	// Occurrences maps a hash to every file/PR location it appears in.
+	Occurrences HashOccurrences
+	// Warnings collects per-PR failures that were skipped rather than aborting
+	// the whole fetch.
+	Warnings []string
+}
+
+func newReviewSet() *ReviewSet {
+	return &ReviewSet{
+		UsersToHashes: make(GhPrHashMap),
+		Changes:       make(HashChangeMap),
+		HashPRs:       make(HashPrMap),
+		PRHashes:      make(PrHashMap),
+		Verified:      make(PrVerifiedMap),
+		Occurrences:   make(HashOccurrences),
+	}
+}
+
+// Users returns the sorted list of PR authors in the set.
+func (r *ReviewSet) Users() []string {
+	users := make([]string, 0, len(r.UsersToHashes))
+	for u := range r.UsersToHashes {
+		users = append(users, u)
+	}
+	sort.Strings(users)
+	return users
+}
 
 func (g *GhClient) getNotifications() ([]*github.Notification, error) {
 	var allNotifications []*github.Notification

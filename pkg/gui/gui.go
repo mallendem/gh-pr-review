@@ -1,12 +1,10 @@
+// Package gui provides a Bubble Tea TUI for the bulk approval workflow: pick
+// the PR authors to review, walk the content hashes their PRs produced, approve
+// or decline each one, then commit the approvals in a batch.
 package gui
 
 import (
-	"bufio"
 	"fmt"
-	"os"
-	"path/filepath"
-	"sort"
-	"strconv"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/viewport"
@@ -16,906 +14,99 @@ import (
 	"github.com/mallendem/gh-pr-review/pkg/gh"
 )
 
-// This package provides a simple Bubble Tea-based TUI to perform the
-// same workflow as ManualApproval but visually. It loads hashes, changes
-// and PRs for a user and allows navigation and approvals.
+type phase int
 
-// settings holds user-configurable options for the GUI.
-type settings struct {
-	reviewComment string // comment to leave on approved PRs
-	contextLines  int    // number of context lines to show around changes
-}
+const (
+	phaseUsers phase = iota
+	phaseReview
+	phaseSettings
+)
 
-// defaultSettings returns settings with default values.
-func defaultSettings() settings {
-	return settings{
-		reviewComment: "This change has been reviewed by a human with a batch tool.",
-		contextLines:  10,
-	}
-}
+// Top-row columns, left to right.
+const (
+	colHashes = iota
+	colChanges
+	colPRs
+	colStaged
+	numColumns
+)
 
-// loadSettingsFromFile reads ~/.gh-pr-approver if it exists and overrides
-// defaults. The file uses a simple "key = value" format (one per line).
-// Supported keys: review_comment, context_lines.
-func loadSettingsFromFile() settings {
-	s := defaultSettings()
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return s
-	}
-	f, err := os.Open(filepath.Join(home, ".gh-pr-approver"))
-	if err != nil {
-		return s
-	}
-	defer f.Close()
-
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		key, value, ok := strings.Cut(line, "=")
-		if !ok {
-			continue
-		}
-		key = strings.TrimSpace(key)
-		value = strings.TrimSpace(value)
-		switch key {
-		case "review_comment":
-			s.reviewComment = value
-		case "context_lines":
-			if n, err := strconv.Atoi(value); err == nil && n >= 0 {
-				s.contextLines = n
-			}
-		}
-	}
-	return s
-}
+const shortHashLen = 6
 
 // model holds the GUI state.
 type model struct {
-	// phase: 0 = user selection, 1 = approval, 2 = settings
-	phase int
+	phase  phase
+	set    *gh.ReviewSet
+	client *gh.GhClient
 
-	hashes       []string
-	changeMap    gh.HashChangeMap
-	rawChangeMap gh.HashRawChangeMap
-	hashPrMap    gh.HashPrMap
-	prMap        map[string][]string
-	verifiedMap  gh.PrVerifiedMap
-	client       *gh.GhClient
+	hashes []string
+	dec    approve.Decisions
 
-	approved  map[string]bool
-	declined  map[string]bool
-	prSkipped map[string]bool
-	committed map[string]bool
 	propagate bool
-	hashIndex int // which hash list item is selected
-	col       int // 0-left(hash),1-middle(change),2-right(prs)
+	dryRun    bool
+	status    string
 
-	status string
-	dryRun bool
+	// Review layout state.
+	hashIndex int
+	col       int
+	focusRow  int             // 0 = top columns, 1 = PR body
+	offsets   [numColumns]int // vertical scroll per top column
+	changeH   int             // horizontal scroll for the changes column
+	occTab    int             // selected occurrence tab in the changes column
+	viewport  viewport.Model
 
-	// Settings and confirmation
-	settings      settings
-	confirmCommit bool // when true, show confirmation dialog overlay
-	settingsField int  // 0 = reviewComment, 1 = contextLines
-	settingsCursor int // cursor position within current settings field edit
-	settingsEdit  string // current edit buffer for settings field
+	termWidth  int
+	termHeight int
 
-	// Commit log popup
-	commitLog       []string
-	showCommitLog   bool
-	commitLogOffset int
+	// Settings panel.
+	settings       settings
+	settingsField  int
+	settingsCursor int
+	settingsEdit   string
 
-	// UI layout state
-	viewport     viewport.Model
-	focusRow     int // 0 = top row, 1 = bottom row
-	termWidth    int
-	termHeight   int
-	bottomHeight int // height allocated to bottom (viewport) including borders
-	topHeight    int // height for the top row columns including borders
-	// offsets for scrolling in the top three columns
-	hashOffset    int
-	changeOffset  int
-	prOffset      int
-	stagedOffset  int
-	stagedPRList  []string
-	changeHOffset int // horizontal offset for changes column
+	confirmCommit bool
 
-	// File tab state for changes panel
-	hashFileMap   gh.HashFileMap // hash → filename
-	changeFileTab int            // index of selected file tab
+	// Scrollable log popup, reused for commit results and fetch warnings.
+	showLog   bool
+	logTitle  string
+	logLines  []string
+	logOffset int
 
-	// User selection phase (phase 0) fields
-	availableUsers   []string
-	userSelected     map[string]bool
-	userCursor       int
-	userHashPrMap    gh.GhPrHashMap
-	userScrollOffset int
+	// User selection panel.
+	availableUsers []string
+	userSelected   map[string]bool
+	userCursor     int
+	userOffset     int
 }
 
 // New creates and returns a Bubble Tea program configured for the user.
 func New(user string, propagate bool, dryRun bool) (*tea.Program, error) {
-	hashes, availableUsers, userHashPrMap, changeMap, hashPrMap, prMap, verifiedMap, hashFileMap, rawChangeMap, client, err := approve.PrepareGUI(user)
+	session, err := approve.PrepareGUI(user)
 	if err != nil {
 		return nil, err
 	}
 
-	// If user was provided (hashes already filtered), go straight to phase 1.
-	// Otherwise start in phase 0 (user selection).
-	phase := 0
-	if user != "" {
-		phase = 1
-	}
-
-	m := model{
-		phase:          phase,
-		hashes:         hashes,
-		changeMap:      changeMap,
-		rawChangeMap:   rawChangeMap,
-		hashPrMap:      hashPrMap,
-		prMap:          prMap,
-		verifiedMap:    verifiedMap,
-		client:         client,
-		approved:       map[string]bool{},
-		declined:       map[string]bool{},
-		prSkipped:      map[string]bool{},
-		committed:      map[string]bool{},
+	m := &model{
+		// A named user means the hashes are already filtered, so skip selection.
+		phase:          phaseUsers,
+		set:            session.Set,
+		client:         session.Client,
+		hashes:         session.Hashes,
+		dec:            approve.NewDecisions(),
 		propagate:      propagate,
-		col:            0,
 		dryRun:         dryRun,
-		focusRow:       0,
-		stagedOffset:   0,
-		stagedPRList:   nil,
-		hashFileMap:    hashFileMap,
-		availableUsers: availableUsers,
+		availableUsers: session.AvailableUsers,
 		userSelected:   map[string]bool{},
-		userCursor:     0,
-		userHashPrMap:  userHashPrMap,
-		settings:       loadSettingsFromFile(),
+		settings:       loadSettings(),
 	}
-	if phase == 1 {
-		// compute initial staged list so the UI shows consistent state immediately
-		m.updateStagedList()
+	if user != "" {
+		m.phase = phaseReview
+		m.selectHash(0)
 	}
-	// viewport will be sized once we receive a WindowSizeMsg in Update
-	m.viewport = viewport.Model{}
-	p := tea.NewProgram(m, tea.WithAltScreen())
-	return p, nil
-}
-
-// Init implements tea.Model
-func (m model) Init() tea.Cmd {
-	return nil
-}
-
-// Update implements tea.Model
-func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	switch msg := msg.(type) {
-	case tea.KeyMsg:
-		k := msg.String()
-		if k == "q" || k == "esc" {
-			return m, tea.Quit
-		}
-
-		// Phase 0: user selection
-		if m.phase == 0 {
-			return m.updateUserSelection(k)
-		}
-
-		// Phase 2: settings panel
-		if m.phase == 2 {
-			return m.updateSettings(k)
-		}
-
-		// Commit log popup
-		if m.showCommitLog {
-			return m.updateCommitLog(k)
-		}
-
-		// Confirmation dialog overlay
-		if m.confirmCommit {
-			return m.updateConfirmation(k)
-		}
-
-		// Phase 1: approval view (existing logic)
-		// toggle focus between rows
-		if k == "tab" {
-			m.focusRow = (m.focusRow + 1) % 2
-			return m, nil
-		}
-
-		// horizontal scroll for changes with alt+a / alt+d
-		if k == "alt+a" {
-			if m.changeHOffset > 0 {
-				m.changeHOffset--
-			}
-			return m, nil
-		}
-		if k == "alt+d" {
-			_, midWidth, _, _ := m.columnWidths()
-			contentW := max(midWidth-4, 10)
-			maxLen := 0
-			for _, cl := range m.changesForFileTab() {
-				maxLen = max(maxLen, len(cl))
-			}
-			if maxOff := maxLen - contentW; m.changeHOffset < maxOff {
-				m.changeHOffset++
-			}
-			return m, nil
-		}
-
-		// column navigation (works in both rows)
-		if k == "a" { // left
-			if m.col > 0 {
-				m.col--
-			}
-			m.focusRow = 0
-			return m, nil
-		}
-		if k == "d" { // right
-			if m.col < 3 {
-				m.col++
-			}
-			m.focusRow = 0
-			return m, nil
-		}
-
-		// If bottom row is focused, w/s should scroll the PR body viewport
-		if m.focusRow == 1 {
-			if k == "w" {
-				m.viewport.LineUp(1)
-				return m, nil
-			}
-			if k == "s" {
-				m.viewport.LineDown(1)
-				return m, nil
-			}
-			if k == "pgup" {
-				m.viewport.PageUp()
-				return m, nil
-			}
-			if k == "pgdown" {
-				m.viewport.PageDown()
-				return m, nil
-			}
-		}
-
-		// when top row is focused, w/s navigate hashes
-		if m.focusRow == 0 {
-			// behavior depends on which top column is active:
-			// - col 0 (hashes): w/s move the selection
-			// - col 1 (changes): w/s scroll the changes pane
-			// - col 2 (PRs): w/s scroll the PR pane
-			// - col 3 (staged): w/s scroll the staged pane
-			if m.col == 0 {
-				if k == "w" { // up (selection)
-					if m.hashIndex > 0 {
-						m.hashIndex--
-						// update viewport content when selection changes
-						m.updateViewportContent()
-						// ensure hashOffset keeps selection visible
-						visible := m.topVisibleLines()
-						ensureOffset(&m.hashOffset, m.hashIndex, visible)
-					}
-					return m, nil
-				}
-				if k == "s" { // down (selection)
-					if m.hashIndex < len(m.hashes)-1 {
-						m.hashIndex++
-						m.updateViewportContent()
-						visible := m.topVisibleLines()
-						ensureOffset(&m.hashOffset, m.hashIndex, visible)
-					}
-					return m, nil
-				}
-			} else if m.col == 1 {
-				// file tab navigation
-				if k == "e" {
-					if m.changeFileTab > 0 {
-						m.changeFileTab--
-						m.changeOffset = 0
-						m.changeHOffset = 0
-					}
-					return m, nil
-				}
-				if k == "r" {
-					files := m.changeFilesForHash()
-					if m.changeFileTab < len(files)-1 {
-						m.changeFileTab++
-						m.changeOffset = 0
-						m.changeHOffset = 0
-					}
-					return m, nil
-				}
-				// changes pane scroll
-				if k == "w" {
-					if m.changeOffset > 0 {
-						m.changeOffset--
-					}
-					return m, nil
-				}
-				if k == "s" {
-					// bound by number of change lines for active file tab
-					changes := m.changesForFileTab()
-					if len(changes) > 0 {
-						visible := m.topVisibleLines() - 2 // minus title and tab bar
-						if visible < 1 {
-							visible = 1
-						}
-						maxOff := len(changes) - visible
-						if maxOff < 0 {
-							maxOff = 0
-						}
-						if m.changeOffset < maxOff {
-							m.changeOffset++
-						}
-					}
-					return m, nil
-				}
-			} else if m.col == 2 {
-				// PRs pane scroll
-				if k == "w" {
-					if m.prOffset > 0 {
-						m.prOffset--
-					}
-					return m, nil
-				}
-				if k == "s" {
-					sel := ""
-					if len(m.hashes) > 0 && m.hashIndex < len(m.hashes) {
-						sel = m.hashes[m.hashIndex]
-					}
-					if sel != "" {
-						if prs, ok := m.hashPrMap[sel]; ok {
-							visible := m.topVisibleLines() - 1
-							if visible < 1 {
-								visible = 1
-							}
-							maxOff := len(prs) - visible
-							if maxOff < 0 {
-								maxOff = 0
-							}
-							if m.prOffset < maxOff {
-								m.prOffset++
-							}
-						}
-					}
-					return m, nil
-				}
-			} else if m.col == 3 {
-				// staged pane scroll
-				if k == "w" {
-					if m.stagedOffset > 0 {
-						m.stagedOffset--
-					}
-					return m, nil
-				}
-				if k == "s" {
-					sel := ""
-					if len(m.hashes) > 0 && m.hashIndex < len(m.hashes) {
-						sel = m.hashes[m.hashIndex]
-					}
-					if sel != "" {
-						// staged pane scroll should be based on staged PRs (not hashes)
-						stagedKeys := m.stagedPrKeys()
-						visible := m.topVisibleLines() - 1
-						if visible < 1 {
-							visible = 1
-						}
-						maxOff := len(stagedKeys) - visible
-						if maxOff < 0 {
-							maxOff = 0
-						}
-						if m.stagedOffset < maxOff {
-							m.stagedOffset++
-						}
-					}
-					return m, nil
-				}
-			}
-			if k == "x" { // approve
-				if m.hashIndex >= 0 && m.hashIndex < len(m.hashes) {
-					h := m.hashes[m.hashIndex]
-					// mark approved and remove any declined marker for this hash
-					delete(m.declined, h)
-					m.approved[h] = true
-					if m.propagate {
-						// auto-approve linked hashes (quiet)
-						approve.ApproveLinkedHashes(h, m.approved, m.declined, m.hashPrMap, m.prMap, true)
-					}
-					m.status = fmt.Sprintf("approved %s", h[:6])
-					// ensure UI reflects the change immediately
-					// reconcile any PRs that were skipped earlier and may now be eligible
-					m.reconcilePrSkipped()
-					m.updateStagedList()
-					m.updateViewportContent()
-				}
-				return m, nil
-			}
-			if k == "f" { // decline selected hash with 'f'
-				if m.hashIndex >= 0 && m.hashIndex < len(m.hashes) {
-					h := m.hashes[m.hashIndex]
-					// mark declined and remove any approved marker for this hash
-					delete(m.approved, h)
-					m.declined[h] = true
-					// auto-decline linked hashes quietly and mark PRs skipped
-					approve.DeclineLinkedHashes(h, m.declined, m.prSkipped, m.hashPrMap, m.prMap, true)
-					// remove any hashes that got marked declined from approved map to keep state consistent
-					for dh := range m.declined {
-						if m.approved[dh] {
-							delete(m.approved, dh)
-						}
-					}
-					// update staged PR list and UI
-					// reconcile skipped PRs in case some were unskipped by downstream effects
-					m.reconcilePrSkipped()
-					m.updateStagedList()
-					m.status = fmt.Sprintf("declined %s", h[:6])
-					m.updateViewportContent()
-				}
-				return m, nil
-			}
-			if k == "p" { // open settings panel
-				m.phase = 2
-				m.settingsField = 0
-				m.loadCurrentSettingsField()
-				return m, nil
-			}
-			if k == "c" { // commit changes — show confirmation dialog
-				filtered := m.buildFilteredPrMap()
-				if len(filtered) > 0 {
-					m.confirmCommit = true
-				} else {
-					m.status = "no staged PRs to commit"
-				}
-				return m, nil
-			}
-		}
-
-	case tea.WindowSizeMsg:
-		// store terminal size, compute layout widths and initialize viewport
-		m.termWidth = msg.Width
-		m.termHeight = msg.Height
-
-		// Reserve header/footer heights so the total rendered rows fit the terminal.
-		// header (status line) = 1, footer (hint) = 1
-		headerH := 1
-		footerH := 1
-		reserved := headerH + footerH
-
-		// bottom outer height (including border/padding) should be roughly 1/3 of terminal but leave room for reserved lines
-		bottomOuter := (msg.Height - reserved) / 3
-		if bottomOuter < 6 {
-			bottomOuter = 6
-		}
-		// top outer gets the rest
-		topOuter := msg.Height - reserved - bottomOuter
-		if topOuter < 3 {
-			topOuter = 3
-			// adjust bottomOuter if needed
-			if msg.Height-reserved-topOuter >= 3 {
-				bottomOuter = msg.Height - reserved - topOuter
-			}
-		}
-
-		m.bottomHeight = bottomOuter
-		m.topHeight = topOuter
-
-		// viewport inner size must account for border and padding. We use padding=1 and border=1 on top/bottom,
-		// so inner height = bottomOuter - borderTop - borderBottom - padTop - padBottom = bottomOuter - 4
-		vpH := bottomOuter - 4
-		if vpH < 1 {
-			vpH = 1
-		}
-		// viewport width similarly accounts for left/right borders/padding; subtract 4
-		vpW := msg.Width - 4
-		if vpW < 10 {
-			vpW = 10
-		}
-
-		m.viewport = viewport.New(vpW, vpH)
-		m.updateViewportContent()
-		// ensure viewport shows from the top after resize
-		m.viewport.GotoTop()
-		return m, nil
+	if n := len(session.Set.Warnings); n > 0 {
+		m.status = fmt.Sprintf("%d PR(s) could not be read — press l for details", n)
 	}
-
-	return m, nil
-}
-
-// updateViewportContent updates the viewport with the PR body of the currently selected PR (first PR for selected hash)
-func (m *model) updateViewportContent() {
-	selectedHash := m.selectedHash()
-	body := ""
-	if selectedHash != "" {
-		if prs, ok := m.hashPrMap[selectedHash]; ok && len(prs) > 0 {
-			if b, err := m.client.GetPrComment(prs[0]); err == nil {
-				body = b
-			} else {
-				body = "(no body)"
-			}
-		} else {
-			body = "(no PR)"
-		}
-	}
-	m.viewport.SetContent(body)
-	// reset viewport scroll to top so the beginning of the PR body is visible
-	m.viewport.GotoTop()
-	// reset top-column offsets for the newly selected hash so related panes start at top
-	m.changeOffset = 0
-	m.prOffset = 0
-	m.stagedOffset = 0
-	// auto-select the file tab matching this hash's file
-	m.updateChangeFileTab()
-	// refresh cached staged PRs whenever the visible selection or approvals change
-	m.updateStagedList()
-}
-
-// updateStagedList recomputes and stores the list of PR keys that would be approved
-func (m *model) updateStagedList() {
-	m.stagedPRList = m.stagedPrKeys()
-}
-
-// View implements tea.Model
-func (m model) View() string {
-	if m.phase == 0 {
-		return m.viewUserSelection()
-	}
-	if m.phase == 2 {
-		return m.viewSettings()
-	}
-	if m.showCommitLog {
-		return m.viewCommitLog()
-	}
-	// If confirmation dialog is showing, render it as an overlay
-	if m.confirmCommit {
-		return m.viewConfirmation()
-	}
-
-	leftWidth, midWidth, prWidth, stagedWidth := m.columnWidths()
-
-	// apply the top row height to all three columns so the top region occupies the same vertical space
-	// subtract estimated extra space used by borders and padding so the rendered blocks fit the terminal
-	topOuter := m.topHeight
-	if topOuter == 0 {
-		topOuter = m.termHeight - m.bottomHeight - 2
-		if topOuter < 3 {
-			topOuter = 3
-		}
-	}
-	// subtract 2 lines to account for border/padding differences (conservative)
-	topBlockH := topOuter - 2
-	if topBlockH < 1 {
-		topBlockH = 1
-	}
-	yellowBorder := lipgloss.NewStyle().BorderForeground(lipgloss.Color("11"))
-	baseCol := func(w int) lipgloss.Style {
-		return lipgloss.NewStyle().Width(w).Height(topBlockH).MaxHeight(topBlockH + 2).Border(lipgloss.NormalBorder()).PaddingLeft(1).PaddingRight(1)
-	}
-	left := baseCol(leftWidth)
-	mid := baseCol(midWidth)
-	prStyle := baseCol(prWidth)
-	stagedStyle := baseCol(stagedWidth)
-	if m.focusRow == 0 {
-		switch m.col {
-		case 0:
-			left = left.Inherit(yellowBorder)
-		case 1:
-			mid = mid.Inherit(yellowBorder)
-		case 2:
-			prStyle = prStyle.Inherit(yellowBorder)
-		case 3:
-			stagedStyle = stagedStyle.Inherit(yellowBorder)
-		}
-	}
-
-	// build column title row
-	titleStyle := lipgloss.NewStyle().Bold(true)
-	leftTitle := titleStyle.Render("Hashes")
-	midTitle := titleStyle.Render("Changes")
-	rightTitle := titleStyle.Render("Related PRs")
-	stagedTitle := titleStyle.Render("Staged changes")
-
-	selectedHash := m.selectedHash()
-
-	// left column: show hashes (6 chars)
-	var leftLines []string
-	leftLines = append(leftLines, leftTitle)
-	// prepare full list of hash lines (without selection background)
-	fullLeft := []string{}
-	for _, h := range m.hashes {
-		short := h
-		if len(h) > 6 {
-			short = h[:6]
-		}
-		marker := " "
-		if m.approved[h] {
-			marker = "✓"
-		} else if m.declined[h] {
-			marker = "x"
-		}
-		line := fmt.Sprintf("%s %s", marker, short)
-		if m.approved[h] {
-			line = lipgloss.NewStyle().Foreground(lipgloss.Color("10")).Render(line)
-		} else if m.declined[h] {
-			line = lipgloss.NewStyle().Foreground(lipgloss.Color("9")).Render(line)
-		}
-		fullLeft = append(fullLeft, line)
-	}
-
-	visible := m.topVisibleLines()
-	// clamp offsets
-	if m.hashOffset < 0 {
-		m.hashOffset = 0
-	}
-	if m.hashOffset > len(fullLeft)-visible {
-		m.hashOffset = len(fullLeft) - visible
-	}
-	if m.hashOffset < 0 {
-		m.hashOffset = 0
-	}
-
-	window := sliceForWindow(fullLeft, m.hashOffset, visible)
-	// append windowed lines and apply selection highlight if selection is within window
-	for i, line := range window {
-		origIndex := m.hashOffset + i
-		if origIndex == m.hashIndex && m.col == 0 && m.focusRow == 0 {
-			leftLines = append(leftLines, lipgloss.NewStyle().Background(lipgloss.Color("62")).Render(line))
-		} else if m.col == 0 && m.focusRow == 0 {
-			// column focused -> render with slight background to indicate focus
-			leftLines = append(leftLines, lipgloss.NewStyle().Render(line))
-		} else {
-			leftLines = append(leftLines, line)
-		}
-	}
-
-	// middle column: show changes for selected hash (with file tabs)
-	var midLines []string
-	midLines = append(midLines, midTitle)
-	// render file tab bar
-	tabBar := m.renderFileTabs(midWidth)
-	if tabBar != "" {
-		midLines = append(midLines, tabBar)
-	}
-	if selectedHash != "" {
-		fullChanges := m.changesForFileTab()
-		if len(fullChanges) > 0 {
-			// subtract title + tab bar from visible lines
-			headerLines := 1 // title
-			if tabBar != "" {
-				headerLines = 2 // title + tab bar
-			}
-			visible := m.topVisibleLines() - headerLines
-			if visible < 1 {
-				visible = 1
-			}
-			// clamp changeOffset
-			if m.changeOffset < 0 {
-				m.changeOffset = 0
-			}
-			if m.changeOffset > len(fullChanges)-visible {
-				m.changeOffset = len(fullChanges) - visible
-			}
-			if m.changeOffset < 0 {
-				m.changeOffset = 0
-			}
-			win := sliceForWindow(fullChanges, m.changeOffset, visible)
-			// compute content width for changes (reserve padding inside mid box)
-			contentW := midWidth - 4
-			if contentW < 10 {
-				contentW = 10
-			}
-			for _, cl := range win {
-				display := cl
-				// apply horizontal offset: show substring of the line
-				r := []rune(display)
-				start := m.changeHOffset
-				if start < 0 {
-					start = 0
-				}
-				if start >= len(r) {
-					display = ""
-				} else {
-					end := start + contentW
-					if end > len(r) {
-						end = len(r)
-					}
-					display = string(r[start:end])
-				}
-				// add left/right indicators if truncated
-				if m.changeHOffset > 0 {
-					display = "«" + display
-				}
-				if len([]rune(cl)) > m.changeHOffset+contentW {
-					display = display + "»"
-				}
-				// apply coloring based on line prefix
-				if strings.HasPrefix(cl, "+") {
-					display = lipgloss.NewStyle().Foreground(lipgloss.Color("10")).Render(display)
-				} else if strings.HasPrefix(cl, "-") {
-					display = lipgloss.NewStyle().Foreground(lipgloss.Color("9")).Render(display)
-				} else if cl == "..." {
-					display = lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Render(display)
-				}
-				midLines = append(midLines, display)
-			}
-		} else {
-			midLines = append(midLines, "(no changes)")
-		}
-	}
-
-	// PRs column: Related PRs for selected hash
-	var prLines []string
-	prLines = append(prLines, rightTitle)
-	var fullPRs []string
-	if selectedHash != "" {
-		if prs, ok := m.hashPrMap[selectedHash]; ok {
-			for i, pr := range prs {
-				prKey := pr.GetHTMLURL()
-				fullPRs = append(fullPRs, m.renderPRLabel(prKey, i))
-				// show linked hashes for this PR
-				if linkedHashes, ok := m.prMap[prKey]; ok {
-					for j, lh := range linkedHashes {
-						short := lh
-						if len(lh) > 6 {
-							short = lh[:6]
-						}
-						connector := "├─"
-						if j == len(linkedHashes)-1 {
-							connector = "└─"
-						}
-						marker := "✓"
-						color := lipgloss.Color("10")
-						if m.declined[lh] {
-							marker = "×"
-							color = lipgloss.Color("9")
-						} else if !m.approved[lh] {
-							marker = "?"
-							color = lipgloss.Color("8")
-						}
-						hashLine := lipgloss.NewStyle().Foreground(color).Render(
-							fmt.Sprintf("  %s %s %s", connector, short, marker))
-						fullPRs = append(fullPRs, hashLine)
-					}
-				}
-			}
-			visible := m.topVisibleLines()
-			// clamp prOffset
-			if m.prOffset < 0 {
-				m.prOffset = 0
-			}
-			if m.prOffset > len(fullPRs)-visible {
-				m.prOffset = len(fullPRs) - visible
-			}
-			if m.prOffset < 0 {
-				m.prOffset = 0
-			}
-			win := sliceForWindow(fullPRs, m.prOffset, visible)
-			for _, line := range win {
-				if m.col == 2 && m.focusRow == 0 {
-					prLines = append(prLines, lipgloss.NewStyle().Background(lipgloss.Color("62")).Render(line))
-				} else {
-					prLines = append(prLines, line)
-				}
-			}
-		} else {
-			prLines = append(prLines, "(no PRs)")
-		}
-	}
-
-	// build staged PR list: PRs that would be approved (not skipped, not all-declined, all non-declined hashes approved)
-	// Ensure it's sorted and non-nil
-	// compute staged PRs fresh so the staged column always reflects current state
-	stagedPRs := m.stagedPrKeys()
-
-	var stagedLines []string
-	stagedLines = append(stagedLines, stagedTitle)
-	if len(stagedPRs) == 0 {
-		stagedLines = append(stagedLines, "(no staged PRs)")
-	} else {
-		for i, prKey := range stagedPRs {
-			stagedLines = append(stagedLines, m.renderPRLabel(prKey, i))
-		}
-	}
-
-	// make staged column scrollable: clamp stagedOffset and window the lines
-	visible = m.topVisibleLines()
-	if m.stagedOffset < 0 {
-		m.stagedOffset = 0
-	}
-	if m.stagedOffset > len(stagedLines)-visible {
-		m.stagedOffset = len(stagedLines) - visible
-	}
-	if m.stagedOffset < 0 {
-		m.stagedOffset = 0
-	}
-	stagedWindow := sliceForWindow(stagedLines, m.stagedOffset, visible)
-	if stagedWindow == nil {
-		stagedWindow = []string{stagedLines[0]}
-	}
-
-	// Add scrollbars to each column.
-	// The hash column is too narrow for an inline scrollbar — skip it.
-	// For the other columns each line is already bounded to (columnWidth-4) visible
-	// chars by the horizontal scroll / change-width logic, so appending " █" (2 chars)
-	// fits exactly within the (columnWidth-2) content area.
-	visible = m.topVisibleLines()
-
-	// changes scrollbar (based on content excluding title+tabbar)
-	changesTotal := 0
-	if selectedHash != "" {
-		changesTotal = len(m.changesForFileTab())
-	}
-	headerCount := 1
-	if tabBar != "" {
-		headerCount = 2
-	}
-	changeScrollVisible := max(visible-headerCount, 1)
-	changeScrollbar := renderScrollbar(changeScrollVisible, changesTotal, m.changeOffset)
-	if len(midLines) > headerCount {
-		contentLines := midLines[headerCount:]
-		withScroll := appendScrollbar(contentLines, changeScrollbar, midWidth-2)
-		midLines = append(midLines[:headerCount], withScroll...)
-	}
-
-	// PR scrollbar
-	prScrollbar := renderScrollbar(len(prLines)-1, len(fullPRs), m.prOffset)
-	prWithScroll := appendScrollbar(prLines[1:], prScrollbar, prWidth-2)
-	prLines = append(prLines[:1], prWithScroll...)
-
-	// staged scrollbar
-	stagedScrollbar := renderScrollbar(len(stagedWindow), len(stagedLines), m.stagedOffset)
-	stagedWindow = appendScrollbar(stagedWindow, stagedScrollbar, stagedWidth-2)
-
-	leftBox := left.Render(strings.Join(leftLines, "\n"))
-	midBox := mid.Render(strings.Join(midLines, "\n"))
-	prBox := prStyle.Render(strings.Join(prLines, "\n"))
-	stagedBox := stagedStyle.Render(strings.Join(stagedWindow, "\n"))
-
-	top := lipgloss.JoinHorizontal(lipgloss.Top, leftBox, midBox, prBox, stagedBox)
-
-	// bottom: show the viewport content (scrollable PR body). When focused, visually indicate focus.
-	// Use the stored bottomHeight (including borders) for consistent sizing
-	bottomOuter := m.bottomHeight
-	if bottomOuter == 0 {
-		bottomOuter = 10
-	}
-	// reduce bottom outer by 2 to allow for border/padding conservative fit
-	bottomBlockH := bottomOuter - 2
-	if bottomBlockH < 3 {
-		bottomBlockH = 3
-	}
-	bottomStyle := lipgloss.NewStyle().Height(bottomBlockH).Border(lipgloss.NormalBorder()).Padding(1)
-	if m.focusRow == 1 {
-		bottomStyle = bottomStyle.Inherit(yellowBorder)
-	}
-	bodyView := m.viewport.View()
-	if bodyView == "" {
-		bodyView = "(no PR body)"
-	}
-
-	// footer with keybind hints (bottom-left)
-	hint := "tab: switch row • a/d: left/right • w/s: up/down • e/r: file tabs • x: approve • f: decline • c: commit • p: settings • q: quit • alt+a/d: hscroll"
-	footer := lipgloss.NewStyle().Padding(0, 1).Render(hint)
-
-	bottom := bottomStyle.Render(bodyView)
-
-	// join everything with footer below; no extra spacer lines so the layout fits the terminal exactly
-	return lipgloss.JoinVertical(lipgloss.Left,
-		fmt.Sprintf("Column: %d | Selected hash: %s | Status: %s", m.col+1, func() string {
-			if selectedHash == "" {
-				return "-"
-			} else {
-				return selectedHash[:6]
-			}
-		}(), m.status),
-		top,
-		bottom,
-		footer,
-	)
+	return tea.NewProgram(m, tea.WithAltScreen()), nil
 }
 
 // Run starts the GUI program and blocks until it exits.
@@ -928,165 +119,173 @@ func Run(user string, propagate bool, dryRun bool) error {
 	return err
 }
 
-// ensureOffset ensures the given offset keeps the given index visible within the top-visible range.
-func ensureOffset(offset *int, index int, visible int) {
-	if index < *offset {
-		// index is above visible range, move offset up
-		*offset = index
-	}
-	if index >= *offset+visible {
-		// index is below visible range, move offset down
-		*offset = index - visible + 1
-	}
-}
+// Init implements tea.Model.
+func (m *model) Init() tea.Cmd { return nil }
 
-// topVisibleLines computes the number of lines visible in the top columns based on the current terminal size and allocated top height.
-func (m model) topVisibleLines() int {
-	// Compute visible lines in the top columns (excluding the title line).
-	// Derive topOuter similar to View: outer allocated, then conservative subtraction applied there.
-	topOuter := m.topHeight
-	if topOuter == 0 {
-		topOuter = m.termHeight - m.bottomHeight - 2
-		if topOuter < 3 {
-			topOuter = 3
+// Update implements tea.Model.
+func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.resize(msg.Width, msg.Height)
+		return m, nil
+
+	case tea.KeyMsg:
+		if msg.Type == tea.KeyCtrlC {
+			return m, tea.Quit
+		}
+		switch {
+		case m.phase == phaseUsers:
+			return m, m.updateUserSelection(msg.String())
+		case m.phase == phaseSettings:
+			// Handled first so plain letters, including q, reach the editor.
+			m.updateSettings(msg)
+			return m, nil
+		case m.showLog:
+			m.updateLog(msg.String())
+			return m, nil
+		case m.confirmCommit:
+			m.updateConfirmation(msg.String())
+			return m, nil
+		default:
+			return m, m.updateReview(msg.String())
 		}
 	}
-	// topBlockH is what View sets as Height for the blocks after conservative subtraction
-	topBlockH := topOuter - 2
-	if topBlockH < 1 {
-		topBlockH = 1
-	}
-	// one line is used for the column title; the rest are usable lines
-	visible := topBlockH - 1
-	if visible < 1 {
-		visible = 1
-	}
-	return visible
+	return m, nil
 }
 
-// helper to get a slice of strings from items starting at offset with length up to visible
-func sliceForWindow(items []string, offset, visible int) []string {
-	if offset < 0 {
-		offset = 0
-	}
-	if offset >= len(items) {
-		return nil
-	}
-	end := offset + visible
-	if end > len(items) {
-		end = len(items)
-	}
-	return items[offset:end]
+func (m *model) resize(width, height int) {
+	m.termWidth = width
+	m.termHeight = height
+	_, bottom := m.rowHeights()
+	m.viewport = viewport.New(max(width-borderCells-paddingCells, 10), max(bottom-borderCells-paddingCells, 1))
+	m.refreshBody()
 }
 
-// isPRFullyApproved returns true if all hashes for the PR are approved (none declined).
-func (m *model) isPRFullyApproved(phashes []string) bool {
-	if len(m.approved) == 0 {
-		return false
+// --- Geometry ---
+
+// rowHeights returns the outer height (borders included) of the top column row
+// and of the PR body box. Together with the header and footer they add up to
+// the terminal height exactly.
+func (m *model) rowHeights() (top, bottom int) {
+	usable := max(m.termHeight-2, 8) // minus header and footer
+	bottom = max(usable/3, 6)
+	top = usable - bottom
+	if top < 5 {
+		top = 5
+		bottom = max(usable-top, 3)
 	}
-	for _, ph := range phashes {
-		if m.declined[ph] || !m.approved[ph] {
-			return false
+	return top, bottom
+}
+
+// columnWidths returns the content width of each top column. They always sum to
+// termWidth-8, so the four bordered boxes occupy the terminal exactly: any
+// overshoot makes every row wrap and the whole grid double-spaces.
+func (m *model) columnWidths() [numColumns]int {
+	total := max(m.termWidth, 40) - numColumns*borderCells
+
+	// Marker, space and the short hash, with slack in case the terminal renders
+	// the check mark double-width.
+	hash := min(shortHashLen+3+paddingCells+scrollbarCells, total/4)
+	staged := min(40, max(total/5, 10))
+	prs := min(48, max(total/4, 10))
+	mid := total - hash - staged - prs
+	// Borrow from the side columns rather than letting the middle overflow.
+	for mid < 12 && (prs > 10 || staged > 10) {
+		if prs >= staged {
+			prs--
+		} else {
+			staged--
 		}
+		mid++
 	}
-	return true
+	return [numColumns]int{hash, mid, prs, staged}
 }
 
-func (m *model) stagedPrKeys() []string {
-	var stagedPRs []string
-	for prKey, phashes := range m.prMap {
-		if m.isPRFullyApproved(phashes) {
-			if m.prSkipped[prKey] {
-				delete(m.prSkipped, prKey)
-			}
-			stagedPRs = append(stagedPRs, prKey)
-		}
-	}
-	sort.Strings(stagedPRs)
-	return stagedPRs
+// topContentHeight is the number of lines inside a top column, borders excluded.
+func (m *model) topContentHeight() int {
+	top, _ := m.rowHeights()
+	return max(top-borderCells, 1)
 }
 
-// prApprovalState returns (allApproved, anyDeclined, committed) for a PR.
-func (m *model) prApprovalState(prKey string) (bool, bool, bool) {
-	hashes, ok := m.prMap[prKey]
-	if !ok {
-		return false, false, false
-	}
-	anyDeclined := false
-	allApproved := true
-	allCommitted := true
-	for _, h := range hashes {
-		if m.declined[h] {
-			anyDeclined = true
-			allApproved = false
-		}
-		if !m.approved[h] {
-			allApproved = false
-		}
-		if !m.committed[h] {
-			allCommitted = false
-		}
-	}
-	return allApproved, anyDeclined, allCommitted
-}
+// --- Selection ---
 
-func (m *model) renderPRLabel(prKey string, idx int) string {
-	verifiedIcon := approve.VerifiedIcon(m.verifiedMap[prKey])
-	label := fmt.Sprintf("[%d] %s %s", idx+1, verifiedIcon, prKey)
-	allApproved, anyDeclined, committed := m.prApprovalState(prKey)
-	if committed {
-		return lipgloss.NewStyle().Foreground(lipgloss.Color("6")).Render(label)
-	}
-	if anyDeclined {
-		return lipgloss.NewStyle().Foreground(lipgloss.Color("9")).Render(label)
-	}
-	if allApproved {
-		return lipgloss.NewStyle().Foreground(lipgloss.Color("10")).Render(label)
-	}
-	return label
-}
-
-func (m *model) reconcilePrSkipped() {
-	for prKey, phashes := range m.prMap {
-		if m.prSkipped[prKey] && m.isPRFullyApproved(phashes) {
-			delete(m.prSkipped, prKey)
-		}
-	}
-}
-
-// selectedHash returns the currently selected hash or empty string.
-func (m model) selectedHash() string {
-	if len(m.hashes) > 0 && m.hashIndex < len(m.hashes) {
+func (m *model) selectedHash() string {
+	if m.hashIndex >= 0 && m.hashIndex < len(m.hashes) {
 		return m.hashes[m.hashIndex]
 	}
 	return ""
 }
 
-// changeFilesForHash returns the unique file paths where the selected hash's
-// change is applied, across all PRs that contain it. Each entry is formatted
-// as "repo#num:file" so you can see which PR/repo each file belongs to.
-func (m model) changeFilesForHash() []string {
-	sel := m.selectedHash()
-	if sel == "" || len(m.hashFileMap) == 0 {
-		return nil
+// selectHash moves the selection and resets everything scoped to a single hash.
+func (m *model) selectHash(index int) {
+	if len(m.hashes) == 0 {
+		m.hashIndex = 0
+		return
 	}
-	prFiles, ok := m.hashFileMap[sel]
-	if !ok || len(prFiles) == 0 {
-		return nil
+	m.hashIndex = min(max(index, 0), len(m.hashes)-1)
+	m.occTab = 0
+	m.changeH = 0
+	m.offsets[colChanges] = 0
+	m.offsets[colPRs] = 0
+	m.offsets[colStaged] = 0
+	m.refreshBody()
+}
+
+// refreshBody loads the selected hash's first PR description into the viewport.
+func (m *model) refreshBody() {
+	body := "(no PR)"
+	if prs := m.set.HashPRs[m.selectedHash()]; len(prs) > 0 {
+		if b, err := gh.PrBody(prs[0]); err == nil {
+			body = b
+		} else {
+			body = "(no body)"
+		}
 	}
-	var files []string
-	for prURL, file := range prFiles {
-		// Format as "file (repo#num)" for context
-		label := fmt.Sprintf("%s (%s)", file, shortenPRURL(prURL))
-		files = append(files, label)
+	m.viewport.SetContent(body)
+	m.viewport.GotoTop()
+}
+
+// occurrences returns every file/PR location where the selected hash appears.
+func (m *model) occurrences() []gh.Occurrence {
+	return m.set.Occurrences[m.selectedHash()]
+}
+
+// occurrenceLabels renders one tab label per occurrence, disambiguating repeats
+// of the same change within one file.
+func (m *model) occurrenceLabels() []string {
+	occs := m.occurrences()
+	labels := make([]string, len(occs))
+	counts := map[string]int{}
+	for i, o := range occs {
+		labels[i] = fmt.Sprintf("%s (%s)", o.File, shortenPRURL(o.PrURL))
+		counts[labels[i]]++
 	}
-	sort.Strings(files)
-	return files
+	seen := map[string]int{}
+	for i, l := range labels {
+		if counts[l] > 1 {
+			seen[l]++
+			labels[i] = fmt.Sprintf("%s #%d", l, seen[l])
+		}
+	}
+	return labels
+}
+
+// changeLines returns the diff lines shown for the selected occurrence tab.
+func (m *model) changeLines() []string {
+	occs := m.occurrences()
+	if len(occs) == 0 {
+		return m.set.Changes[m.selectedHash()]
+	}
+	return filterContextLines(occs[min(m.occTab, len(occs)-1)].Raw, m.settings.contextLines)
+}
+
+// stagedPRs are the PRs that would be approved if the reviewer committed now.
+func (m *model) stagedPRs() []string {
+	return m.dec.StagedPRs(m.set.PRHashes)
 }
 
 // shortenPRURL turns "https://github.com/owner/repo/pull/123" into "owner/repo#123".
 func shortenPRURL(url string) string {
-	// Expected format: https://github.com/{owner}/{repo}/pull/{number}
 	parts := strings.Split(url, "/")
 	if len(parts) >= 7 {
 		return fmt.Sprintf("%s/%s#%s", parts[3], parts[4], parts[6])
@@ -1094,153 +293,403 @@ func shortenPRURL(url string) string {
 	return url
 }
 
-// changesForFileTab returns the change lines for the selected hash.
-// When contextLines > 0, it uses the raw change map (with context lines)
-// and filters to show only N context lines around changes.
-func (m model) changesForFileTab() []string {
-	sel := m.selectedHash()
-	if sel == "" {
+func shortHash(h string) string {
+	if len(h) > shortHashLen {
+		return h[:shortHashLen]
+	}
+	return h
+}
+
+// --- Review phase input ---
+
+func (m *model) updateReview(k string) tea.Cmd {
+	switch k {
+	case "q", "esc":
+		return tea.Quit
+	case "tab":
+		m.focusRow = (m.focusRow + 1) % 2
+		return nil
+	case "a":
+		m.col = max(m.col-1, 0)
+		m.focusRow = 0
+		return nil
+	case "d":
+		m.col = min(m.col+1, numColumns-1)
+		m.focusRow = 0
+		return nil
+	case "p":
+		m.phase = phaseSettings
+		m.settingsField = 0
+		m.loadSettingsField()
+		return nil
+	case "l":
+		m.openLog("Warnings", m.set.Warnings)
+		return nil
+	case "x":
+		m.approveSelected()
+		return nil
+	case "f":
+		m.declineSelected()
+		return nil
+	case "c":
+		if len(m.stagedPRs()) == 0 {
+			m.status = "no staged PRs to commit"
+		} else {
+			m.confirmCommit = true
+		}
+		return nil
+	case "alt+a":
+		m.changeH = max(m.changeH-1, 0)
+		return nil
+	case "alt+d":
+		widths := m.columnWidths()
+		textW := max(widths[colChanges]-paddingCells-scrollbarCells, 4)
+		longest := 0
+		for _, l := range m.changeLines() {
+			longest = max(longest, len([]rune(l)))
+		}
+		m.changeH = min(m.changeH+1, max(longest-textW, 0))
 		return nil
 	}
-	if m.settings.contextLines >= 0 {
-		if raw, ok := m.rawChangeMap[sel]; ok && len(raw) > 0 {
-			return filterContextLines(raw, m.settings.contextLines)
+
+	if m.focusRow == 1 {
+		switch k {
+		case "w":
+			m.viewport.ScrollUp(1)
+		case "s":
+			m.viewport.ScrollDown(1)
+		case "pgup":
+			m.viewport.PageUp()
+		case "pgdown":
+			m.viewport.PageDown()
 		}
+		return nil
 	}
-	return m.changeMap[sel]
+
+	// e/r step through the occurrence tabs of the changes column.
+	if k == "e" || k == "r" {
+		if n := len(m.occurrences()); n > 0 {
+			if k == "e" {
+				m.occTab = max(m.occTab-1, 0)
+			} else {
+				m.occTab = min(m.occTab+1, n-1)
+			}
+			m.offsets[colChanges] = 0
+			m.changeH = 0
+		}
+		return nil
+	}
+
+	if k != "w" && k != "s" {
+		return nil
+	}
+	delta := 1
+	if k == "w" {
+		delta = -1
+	}
+	if m.col == colHashes {
+		m.selectHash(m.hashIndex + delta)
+		ensureVisible(&m.offsets[colHashes], m.hashIndex, m.paneVisibleLines(colHashes))
+		return nil
+	}
+	total := m.paneTotalLines(m.col)
+	visible := m.paneVisibleLines(m.col)
+	m.offsets[m.col] = clampOffset(m.offsets[m.col]+delta, total, visible)
+	return nil
 }
 
-// renderFileTabs renders the file tab bar for the changes panel.
-// If all tabs fit within the available width, render them normally.
-// Otherwise, show a compact virtual tab: "◄ [2/5] filename ►"
-func (m model) renderFileTabs(midWidth int) string {
-	files := m.changeFilesForHash()
-	if len(files) == 0 {
+// paneVisibleLines is how many scrolling lines a top column can display.
+func (m *model) paneVisibleLines(col int) int {
+	header := 0
+	if col == colChanges && len(m.occurrences()) > 0 {
+		header = 1 // tab bar
+	}
+	return max(m.topContentHeight()-1-header, 1)
+}
+
+// paneTotalLines is how many content lines a top column holds in total.
+func (m *model) paneTotalLines(col int) int {
+	switch col {
+	case colHashes:
+		return len(m.hashes)
+	case colChanges:
+		return len(m.changeLines())
+	case colPRs:
+		return len(m.relatedPRLines())
+	case colStaged:
+		return len(m.stagedPRs())
+	}
+	return 0
+}
+
+func (m *model) approveSelected() {
+	h := m.selectedHash()
+	if h == "" {
+		return
+	}
+	m.dec.Approve(h)
+	if m.propagate {
+		approve.ApproveLinkedHashes(h, m.dec, m.set)
+	}
+	m.reconcileSkipped()
+	m.status = fmt.Sprintf("approved %s", shortHash(h))
+}
+
+func (m *model) declineSelected() {
+	h := m.selectedHash()
+	if h == "" {
+		return
+	}
+	m.dec.Decline(h)
+	approve.DeclineLinkedHashes(h, m.dec, m.set)
+	m.reconcileSkipped()
+	m.status = fmt.Sprintf("declined %s", shortHash(h))
+}
+
+// reconcileSkipped clears the skip flag from PRs that have since become fully
+// approved, e.g. because the hash that caused the skip was approved after all.
+func (m *model) reconcileSkipped() {
+	for prKey, hashes := range m.set.PRHashes {
+		if m.dec.Skipped[prKey] && m.dec.PrApproved(hashes) {
+			delete(m.dec.Skipped, prKey)
+		}
+	}
+}
+
+// --- Review phase rendering ---
+
+// View implements tea.Model.
+func (m *model) View() string {
+	switch {
+	case m.phase == phaseUsers:
+		return m.viewUserSelection()
+	case m.phase == phaseSettings:
+		return m.viewSettings()
+	case m.showLog:
+		return m.viewLog()
+	case m.confirmCommit:
+		return m.viewConfirmation()
+	}
+
+	widths := m.columnWidths()
+	height := m.topContentHeight()
+
+	panes := []pane{
+		m.hashPane(widths[colHashes]),
+		m.changePane(widths[colChanges]),
+		m.prPane(widths[colPRs]),
+		m.stagedPane(widths[colStaged]),
+	}
+	boxes := make([]string, len(panes))
+	for i := range panes {
+		panes[i].focused = m.focusRow == 0 && m.col == i
+		panes[i].offset = clampOffset(m.offsets[i], len(panes[i].lines), panes[i].visibleLines(height))
+		m.offsets[i] = panes[i].offset
+		boxes[i] = panes[i].render(height)
+	}
+	top := lipgloss.JoinHorizontal(lipgloss.Top, boxes...)
+
+	_, bottomOuter := m.rowHeights()
+	bottomStyle := lipgloss.NewStyle().
+		Width(max(m.termWidth-borderCells, 10)).
+		Height(max(bottomOuter-borderCells, 1)).
+		Border(lipgloss.NormalBorder()).
+		Padding(0, 1)
+	if m.focusRow == 1 {
+		bottomStyle = bottomStyle.BorderForeground(focusBorder)
+	}
+	body := m.viewport.View()
+	if strings.TrimSpace(body) == "" {
+		body = "(no PR body)"
+	}
+
+	selected := "-"
+	if h := m.selectedHash(); h != "" {
+		selected = shortHash(h)
+	}
+	header := fit(fmt.Sprintf("hash %d/%d: %s | staged: %d | %s",
+		min(m.hashIndex+1, len(m.hashes)), len(m.hashes), selected, len(m.stagedPRs()), m.status), m.termWidth)
+	footer := fit(" tab: row • a/d: column • w/s: scroll • e/r: file • x: approve • f: decline • c: commit • p: settings • l: log • q: quit", m.termWidth)
+
+	return lipgloss.JoinVertical(lipgloss.Left, header, top, bottomStyle.Render(body), footer)
+}
+
+func (m *model) hashPane(width int) pane {
+	lines := make([]styledLine, 0, len(m.hashes))
+	for _, h := range m.hashes {
+		marker, style := " ", lipgloss.NewStyle()
+		switch {
+		case m.dec.Approved[h]:
+			marker, style = "✓", addStyle
+		case m.dec.Declined[h]:
+			marker, style = "x", delStyle
+		}
+		lines = append(lines, styled(marker+" "+shortHash(h), style))
+	}
+	selected := -1
+	if m.focusRow == 0 && m.col == colHashes && len(lines) > 0 {
+		selected = m.hashIndex
+	}
+	return pane{title: "Hashes", lines: lines, selected: selected, width: width}
+}
+
+func (m *model) changePane(width int) pane {
+	p := pane{title: "Changes", width: width, selected: -1}
+	textW := max(width-paddingCells-scrollbarCells, 4)
+	if tabs := m.renderTabBar(textW); tabs != "" {
+		p.header = []string{tabs}
+	}
+	for _, l := range m.changeLines() {
+		style := lipgloss.NewStyle()
+		switch {
+		case strings.HasPrefix(l, "+"):
+			style = addStyle
+		case strings.HasPrefix(l, "-"):
+			style = delStyle
+		case l == "...":
+			style = dimStyle
+		}
+		p.lines = append(p.lines, styled(hscroll(l, m.changeH, textW), style))
+	}
+	if len(p.lines) == 0 {
+		p.lines = []styledLine{plain("(no changes)")}
+	}
+	return p
+}
+
+// hscroll applies the horizontal offset to a diff line, marking both edges when
+// content is cut off.
+func hscroll(line string, offset, width int) string {
+	r := []rune(line)
+	if offset >= len(r) {
 		return ""
 	}
-	tabIdx := m.changeFileTab
-	if tabIdx < 0 || tabIdx >= len(files) {
-		tabIdx = 0
+	out := string(r[offset:min(offset+width, len(r))])
+	if offset > 0 {
+		out = "«" + out
 	}
-	contentW := midWidth - 4
-	if contentW < 10 {
-		contentW = 10
+	if len(r) > offset+width {
+		out += "»"
 	}
+	return out
+}
 
-	// Try rendering all tabs inline
-	var parts []string
-	for i, f := range files {
-		if i == tabIdx {
-			parts = append(parts, lipgloss.NewStyle().Bold(true).Background(lipgloss.Color("62")).Render(" "+f+" "))
-		} else {
-			parts = append(parts, " "+f+" ")
-		}
+// renderTabBar draws the occurrence tabs, collapsing to "◄ [2/5] name ►" when
+// the full list does not fit.
+func (m *model) renderTabBar(width int) string {
+	labels := m.occurrenceLabels()
+	if len(labels) == 0 {
+		return ""
 	}
-	line := strings.Join(parts, "│")
+	tab := min(max(m.occTab, 0), len(labels)-1)
 
-	// Check if the plain text (without ANSI) fits
 	plainLen := 0
-	for i, f := range files {
-		plainLen += len(f) + 2
-		if i > 0 {
-			plainLen++
+	for _, l := range labels {
+		plainLen += len(l) + 3
+	}
+	if plainLen <= width {
+		parts := make([]string, len(labels))
+		for i, l := range labels {
+			if i == tab {
+				parts[i] = selectedStyle.Bold(true).Render(" " + l + " ")
+			} else {
+				parts[i] = " " + l + " "
+			}
 		}
+		return strings.Join(parts, "│")
 	}
 
-	if plainLen <= contentW {
-		return lipgloss.NewStyle().MaxWidth(contentW).Render(line)
-	}
-
-	// Virtual tab mode: show ◄ [idx/total] shortened_name ►
-	current := files[tabIdx]
-	// shorten the filename if needed
-	prefix := fmt.Sprintf("◄ [%d/%d] ", tabIdx+1, len(files))
+	prefix := fmt.Sprintf("◄ [%d/%d] ", tab+1, len(labels))
 	suffix := " ►"
-	maxNameLen := contentW - len(prefix) - len(suffix)
-	if maxNameLen < 3 {
-		maxNameLen = 3
+	maxName := max(width-len(prefix)-len(suffix), 3)
+	name := labels[tab]
+	if len(name) > maxName {
+		name = "…" + name[len(name)-maxName+1:]
 	}
-	name := current
-	if len(name) > maxNameLen {
-		name = "…" + name[len(name)-maxNameLen+1:]
-	}
-	tabLine := prefix + lipgloss.NewStyle().Bold(true).Render(name) + suffix
-	return tabLine
+	return prefix + titleStyle.Render(name) + suffix
 }
 
-// updateChangeFileTab resets the file tab to the first entry when the hash changes.
-func (m *model) updateChangeFileTab() {
-	m.changeFileTab = 0
+// relatedPRLines lists the PRs containing the selected hash, each followed by
+// the other hashes that PR depends on.
+func (m *model) relatedPRLines() []styledLine {
+	var lines []styledLine
+	prs := m.set.HashPRs[m.selectedHash()]
+	if len(prs) == 0 {
+		return []styledLine{plain("(no PRs)")}
+	}
+	for i, pr := range prs {
+		prKey := pr.GetHTMLURL()
+		lines = append(lines, m.prLabel(prKey, i))
+		linked := m.set.PRHashes[prKey]
+		for j, lh := range linked {
+			connector := "├─"
+			if j == len(linked)-1 {
+				connector = "└─"
+			}
+			marker, style := "✓", addStyle
+			switch {
+			case m.dec.Declined[lh]:
+				marker, style = "×", delStyle
+			case !m.dec.Approved[lh]:
+				marker, style = "?", dimStyle
+			}
+			lines = append(lines, styled(fmt.Sprintf("  %s %s %s", connector, shortHash(lh), marker), style))
+		}
+	}
+	return lines
 }
 
-// columnWidths computes the 4-column layout widths (left, mid, pr, staged).
-func (m model) columnWidths() (int, int, int, int) {
-	termW := m.termWidth
-	if termW == 0 {
-		termW = 120
-	}
-
-	leftMax := 0
-	for _, h := range m.hashes {
-		short := h
-		if len(h) > 6 {
-			short = h[:6]
-		}
-		leftMax = max(leftMax, len(short))
-	}
-	leftWidth := max(leftMax+4, 8)
-
-	maxPR := 0
-	for _, prs := range m.hashPrMap {
-		for _, pr := range prs {
-			maxPR = max(maxPR, len(pr.GetHTMLURL()))
-		}
-	}
-	prWidth := max(maxPR+6, 20)
-	stagedWidth := min(36, termW/4)
-	prWidth = min(prWidth, termW/3)
-
-	midWidth := termW - leftWidth - prWidth - stagedWidth - 6
-	if midWidth < 10 {
-		extra := 10 - midWidth
-		if prWidth-extra > 10 {
-			prWidth -= extra
-		} else {
-			prWidth = 10
-		}
-		midWidth = termW - leftWidth - prWidth - stagedWidth - 6
-		if midWidth < 10 {
-			midWidth = 10
-			stagedWidth = min(stagedWidth, 20)
-		}
-	}
-	return leftWidth, midWidth, prWidth, stagedWidth
+func (m *model) prPane(width int) pane {
+	return pane{title: "Related PRs", lines: m.relatedPRLines(), selected: -1, width: width}
 }
 
-// --- Phase 0: User selection ---
+func (m *model) stagedPane(width int) pane {
+	staged := m.stagedPRs()
+	p := pane{title: "Staged changes", selected: -1, width: width}
+	if len(staged) == 0 {
+		p.lines = []styledLine{plain("(no staged PRs)")}
+		return p
+	}
+	for i, prKey := range staged {
+		p.lines = append(p.lines, m.prLabel(prKey, i))
+	}
+	return p
+}
 
-// updateUserSelection handles key input during the user selection phase.
-func (m model) updateUserSelection(k string) (tea.Model, tea.Cmd) {
+// prLabel renders a PR entry coloured by its current decision state.
+func (m *model) prLabel(prKey string, idx int) styledLine {
+	text := fmt.Sprintf("[%d] %s %s", idx+1, approve.VerifiedIcon(m.set.Verified[prKey]), shortenPRURL(prKey))
+	hashes := m.set.PRHashes[prKey]
+	switch {
+	case m.dec.PrCommitted(hashes):
+		return styled(text, committedStyl)
+	case m.dec.PrDeclined(hashes):
+		return styled(text, delStyle)
+	case m.dec.PrApproved(hashes):
+		return styled(text, addStyle)
+	}
+	return plain(text)
+}
+
+// --- User selection phase ---
+
+func (m *model) updateUserSelection(k string) tea.Cmd {
+	visible := max(m.termHeight-6, 1)
 	switch k {
+	case "q", "esc":
+		return tea.Quit
 	case "w", "up":
-		if m.userCursor > 0 {
-			m.userCursor--
-			visible := m.userSelectionVisibleLines()
-			ensureOffset(&m.userScrollOffset, m.userCursor, visible)
-		}
+		m.userCursor = max(m.userCursor-1, 0)
+		ensureVisible(&m.userOffset, m.userCursor, visible)
 	case "s", "down":
-		if m.userCursor < len(m.availableUsers)-1 {
-			m.userCursor++
-			visible := m.userSelectionVisibleLines()
-			ensureOffset(&m.userScrollOffset, m.userCursor, visible)
-		}
+		m.userCursor = min(m.userCursor+1, len(m.availableUsers)-1)
+		ensureVisible(&m.userOffset, m.userCursor, visible)
 	case " ", "x":
 		if m.userCursor >= 0 && m.userCursor < len(m.availableUsers) {
 			u := m.availableUsers[m.userCursor]
 			m.userSelected[u] = !m.userSelected[u]
 		}
 	case "enter":
-		// collect selected users
 		var selected []string
 		for _, u := range m.availableUsers {
 			if m.userSelected[u] {
@@ -1248,36 +697,20 @@ func (m model) updateUserSelection(k string) (tea.Model, tea.Cmd) {
 			}
 		}
 		if len(selected) == 0 {
-			return m, nil
+			m.status = "select at least one user"
+			return nil
 		}
-		// filter hashes for selected users
-		joined := strings.Join(selected, ",")
-		m.hashes = approve.CollectHashesForUsers(joined, m.userHashPrMap)
-		m.phase = 1
-		m.updateStagedList()
-		m.updateViewportContent()
+		m.hashes = approve.CollectHashesForUsers(strings.Join(selected, ","), m.set.UsersToHashes)
+		m.phase = phaseReview
+		m.selectHash(0)
 	}
-	return m, nil
+	return nil
 }
 
-// userSelectionVisibleLines returns the number of user lines visible in the selection panel.
-func (m model) userSelectionVisibleLines() int {
-	// Use most of the terminal height minus header/footer/borders
-	h := m.termHeight - 8
-	if h < 1 {
-		h = 1
-	}
-	return h
-}
-
-// userPRCount returns the number of unique PRs for a given user.
-func (m model) userPRCount(user string) int {
-	hashMap, ok := m.userHashPrMap[user]
-	if !ok {
-		return 0
-	}
+// userPRCount returns the number of unique PRs opened by a user.
+func (m *model) userPRCount(user string) int {
 	seen := map[string]struct{}{}
-	for _, prs := range hashMap {
+	for _, prs := range m.set.UsersToHashes[user] {
 		for _, pr := range prs {
 			seen[pr.GetHTMLURL()] = struct{}{}
 		}
@@ -1285,12 +718,9 @@ func (m model) userPRCount(user string) int {
 	return len(seen)
 }
 
-// viewUserSelection renders the user selection panel.
-func (m model) viewUserSelection() string {
-	titleStyle := lipgloss.NewStyle().Bold(true)
-	title := titleStyle.Render("Select users to review (space/x: toggle, enter: confirm, q: quit)")
-
-	visible := m.userSelectionVisibleLines()
+func (m *model) viewUserSelection() string {
+	visible := max(m.termHeight-6, 1)
+	width := max(m.termWidth-borderCells, 30)
 
 	var lines []string
 	for i, u := range m.availableUsers {
@@ -1298,57 +728,50 @@ func (m model) viewUserSelection() string {
 		if m.userSelected[u] {
 			check = "[x]"
 		}
-		prCount := m.userPRCount(u)
-		label := fmt.Sprintf("%s %s (%d PRs)", check, u, prCount)
+		label := fit(fmt.Sprintf("%s %s (%d PRs)", check, u, m.userPRCount(u)), width-paddingCells)
 		if i == m.userCursor {
-			label = lipgloss.NewStyle().Background(lipgloss.Color("62")).Render(label)
+			label = selectedStyle.Render(label)
 		}
 		lines = append(lines, label)
 	}
+	offset := clampOffset(m.userOffset, len(lines), visible)
 
-	// apply scrolling
-	offset := m.userScrollOffset
-	if offset < 0 {
-		offset = 0
-	}
-	if offset > len(lines)-visible {
-		offset = len(lines) - visible
-	}
-	if offset < 0 {
-		offset = 0
-	}
-	window := sliceForWindow(lines, offset, visible)
-
-	panelWidth := m.termWidth - 4
-	if panelWidth < 30 {
-		panelWidth = 30
-	}
-	panelHeight := visible + 2
 	panel := lipgloss.NewStyle().
-		Width(panelWidth).
-		Height(panelHeight).
+		Width(width).
+		Height(visible).
 		Border(lipgloss.NormalBorder()).
-		Padding(1).
-		Render(strings.Join(window, "\n"))
+		Padding(0, 1).
+		Render(strings.Join(window(lines, offset, visible), "\n"))
 
-	return lipgloss.JoinVertical(lipgloss.Left, title, panel)
+	return lipgloss.JoinVertical(lipgloss.Left,
+		titleStyle.Render("Select users to review (space/x: toggle, enter: confirm, q: quit)"),
+		panel,
+		fit(m.status, max(m.termWidth, 1)))
 }
 
-// --- Settings panel (phase 2) ---
+// --- Settings phase ---
 
-// updateSettings handles key input during the settings phase.
-func (m model) updateSettings(k string) (tea.Model, tea.Cmd) {
-	switch k {
+var settingsFields = []string{"Review comment", "Context lines"}
+
+func (m *model) updateSettings(msg tea.KeyMsg) {
+	switch msg.String() {
+	case "esc":
+		m.phase = phaseReview
+		m.status = "settings unchanged"
 	case "tab":
-		m.saveCurrentSettingsField()
-		m.settingsField = (m.settingsField + 1) % 2
-		m.loadCurrentSettingsField()
+		m.saveSettingsField()
+		m.settingsField = (m.settingsField + 1) % len(settingsFields)
+		m.loadSettingsField()
 	case "enter":
-		m.saveCurrentSettingsField()
-		m.phase = 1
-		// reset scroll offsets so the new settings (e.g. context lines) apply cleanly
-		m.changeOffset = 0
-		m.changeHOffset = 0
+		m.saveSettingsField()
+		m.phase = phaseReview
+		m.changeH = 0
+		m.offsets[colChanges] = 0
+		if err := m.settings.save(); err != nil {
+			m.status = fmt.Sprintf("settings applied but not saved: %v", err)
+		} else {
+			m.status = "settings saved"
+		}
 	case "backspace":
 		if m.settingsCursor > 0 {
 			r := []rune(m.settingsEdit)
@@ -1356,373 +779,203 @@ func (m model) updateSettings(k string) (tea.Model, tea.Cmd) {
 			m.settingsCursor--
 		}
 	case "left":
-		if m.settingsCursor > 0 {
-			m.settingsCursor--
-		}
+		m.settingsCursor = max(m.settingsCursor-1, 0)
 	case "right":
-		if m.settingsCursor < len([]rune(m.settingsEdit)) {
-			m.settingsCursor++
-		}
+		m.settingsCursor = min(m.settingsCursor+1, len([]rune(m.settingsEdit)))
+	case "home":
+		m.settingsCursor = 0
+	case "end":
+		m.settingsCursor = len([]rune(m.settingsEdit))
 	default:
-		// only accept printable characters (single rune)
-		if len(k) == 1 || (len(k) > 1 && !strings.HasPrefix(k, "alt+") && !strings.HasPrefix(k, "ctrl+")) {
-			r := []rune(m.settingsEdit)
-			newR := []rune(k)
-			result := make([]rune, 0, len(r)+len(newR))
-			result = append(result, r[:m.settingsCursor]...)
-			result = append(result, newR...)
-			result = append(result, r[m.settingsCursor:]...)
-			m.settingsEdit = string(result)
-			m.settingsCursor += len(newR)
+		// Only insert real text. Matching on the key *name* would type "up" or
+		// "pgdown" into the field.
+		var typed []rune
+		switch msg.Type {
+		case tea.KeyRunes:
+			typed = msg.Runes
+		case tea.KeySpace:
+			typed = []rune{' '}
+		default:
+			return
 		}
+		r := []rune(m.settingsEdit)
+		m.settingsEdit = string(r[:m.settingsCursor]) + string(typed) + string(r[m.settingsCursor:])
+		m.settingsCursor += len(typed)
 	}
-	return m, nil
 }
 
-// loadCurrentSettingsField loads the current settings field value into the edit buffer.
-func (m *model) loadCurrentSettingsField() {
-	switch m.settingsField {
-	case 0:
+func (m *model) loadSettingsField() {
+	if m.settingsField == 0 {
 		m.settingsEdit = m.settings.reviewComment
-	case 1:
+	} else {
 		m.settingsEdit = fmt.Sprintf("%d", m.settings.contextLines)
 	}
 	m.settingsCursor = len([]rune(m.settingsEdit))
 }
 
-// saveCurrentSettingsField saves the edit buffer back to the appropriate settings field.
-func (m *model) saveCurrentSettingsField() {
-	switch m.settingsField {
-	case 0:
+func (m *model) saveSettingsField() {
+	if m.settingsField == 0 {
 		m.settings.reviewComment = m.settingsEdit
-	case 1:
-		n := 0
-		for _, ch := range m.settingsEdit {
-			if ch >= '0' && ch <= '9' {
-				n = n*10 + int(ch-'0')
-			}
-		}
-		m.settings.contextLines = n
+		return
 	}
+	n := 0
+	for _, ch := range m.settingsEdit {
+		if ch >= '0' && ch <= '9' {
+			n = n*10 + int(ch-'0')
+		}
+	}
+	m.settings.contextLines = n
 }
 
-// viewSettings renders the settings panel.
-func (m model) viewSettings() string {
-	titleStyle := lipgloss.NewStyle().Bold(true)
-	title := titleStyle.Render("Settings (tab: switch field, enter: save & close, q: quit)")
+func (m *model) viewSettings() string {
+	values := []string{m.settings.reviewComment, fmt.Sprintf("%d", m.settings.contextLines)}
+	width := max(m.termWidth-borderCells, 40)
 
-	fields := []struct {
-		label string
-		value string
-	}{
-		{"Review comment", m.settings.reviewComment},
-		{"Context lines", fmt.Sprintf("%d", m.settings.contextLines)},
-	}
-
-	var lines []string
-	for i, f := range fields {
-		display := f.value
+	lines := make([]string, len(settingsFields))
+	for i, label := range settingsFields {
+		display := values[i]
 		if i == m.settingsField {
-			// show the edit buffer with cursor
 			r := []rune(m.settingsEdit)
-			before := string(r[:m.settingsCursor])
-			after := ""
-			cursor := "█"
-			if m.settingsCursor < len(r) {
-				after = string(r[m.settingsCursor:])
-			}
-			display = before + cursor + after
+			display = string(r[:m.settingsCursor]) + "█" + string(r[m.settingsCursor:])
 		}
-		label := fmt.Sprintf("  %s: %s", f.label, display)
+		lines[i] = fit(fmt.Sprintf("  %s: %s", label, display), width-paddingCells)
 		if i == m.settingsField {
-			label = lipgloss.NewStyle().Background(lipgloss.Color("62")).Render(label)
+			lines[i] = selectedStyle.Render(lines[i])
 		}
-		lines = append(lines, label)
 	}
 
-	panelWidth := m.termWidth - 4
-	if panelWidth < 40 {
-		panelWidth = 40
-	}
 	panel := lipgloss.NewStyle().
-		Width(panelWidth).
-		Height(len(lines) + 4).
+		Width(width).
 		Border(lipgloss.NormalBorder()).
 		Padding(1).
 		Render(strings.Join(lines, "\n"))
 
-	return lipgloss.JoinVertical(lipgloss.Left, title, panel)
+	return lipgloss.JoinVertical(lipgloss.Left,
+		titleStyle.Render("Settings (tab: switch field, enter: save & close, esc: cancel)"),
+		panel)
 }
 
 // --- Confirmation dialog ---
 
-// buildFilteredPrMap returns a map of PRs that are eligible for approval.
-func (m *model) buildFilteredPrMap() map[string][]string {
-	filtered := make(map[string][]string)
-	for prKey, phashes := range m.prMap {
-		if m.prSkipped[prKey] {
-			continue
-		}
-		allDeclined := true
-		for _, ph := range phashes {
-			if !m.declined[ph] {
-				allDeclined = false
-				break
-			}
-		}
-		if allDeclined {
-			continue
-		}
-		allApproved := true
-		for _, ph := range phashes {
-			if m.declined[ph] {
-				allApproved = false
-				break
-			}
-			if len(m.approved) > 0 {
-				if !m.approved[ph] {
-					allApproved = false
-					break
-				}
-			} else {
-				allApproved = false
-				break
-			}
-		}
-		if allApproved {
-			filtered[prKey] = phashes
-		}
-	}
-	return filtered
-}
-
-// updateConfirmation handles key input during the confirmation dialog.
-func (m model) updateConfirmation(k string) (tea.Model, tea.Cmd) {
+func (m *model) updateConfirmation(k string) {
 	switch k {
 	case "y":
-		filtered := m.buildFilteredPrMap()
-		var logs []string
-		if len(filtered) > 0 {
-			logs = approve.ProcessApprovals(filtered, m.approved, m.declined, m.prSkipped, m.hashPrMap, m.client, m.dryRun, m.settings.reviewComment)
-			for _, phashes := range filtered {
-				for _, ph := range phashes {
-					m.committed[ph] = true
-				}
-			}
-			m.reconcilePrSkipped()
-			m.updateStagedList()
-		}
-		m.confirmCommit = false
-		m.status = "committed approvals"
-		m.viewport.GotoTop()
-		m.updateViewportContent()
-		// show commit log popup if there's anything to show
-		if len(logs) > 0 {
-			m.commitLog = logs
-			m.commitLogOffset = 0
-			m.showCommitLog = true
-		}
-	case "n":
+		m.commit()
+	case "n", "esc":
 		m.confirmCommit = false
 		m.status = "commit cancelled"
 	}
-	return m, nil
 }
 
-// --- Commit log popup ---
-
-// updateCommitLog handles key input while the commit log popup is shown.
-func (m model) updateCommitLog(k string) (tea.Model, tea.Cmd) {
-	switch k {
-	case "enter", "q", "esc":
-		m.showCommitLog = false
-	case "w", "up":
-		if m.commitLogOffset > 0 {
-			m.commitLogOffset--
-		}
-	case "s", "down":
-		visible := m.commitLogVisibleLines()
-		maxOff := len(m.commitLog) - visible
-		if maxOff < 0 {
-			maxOff = 0
-		}
-		if m.commitLogOffset < maxOff {
-			m.commitLogOffset++
-		}
-	case "pgup":
-		visible := m.commitLogVisibleLines()
-		m.commitLogOffset -= visible
-		if m.commitLogOffset < 0 {
-			m.commitLogOffset = 0
-		}
-	case "pgdown":
-		visible := m.commitLogVisibleLines()
-		maxOff := len(m.commitLog) - visible
-		if maxOff < 0 {
-			maxOff = 0
-		}
-		m.commitLogOffset += visible
-		if m.commitLogOffset > maxOff {
-			m.commitLogOffset = maxOff
+func (m *model) commit() {
+	staged := m.stagedPRs()
+	logs := approve.ProcessApprovals(m.set, m.dec, m.client, m.dryRun, m.settings.reviewComment)
+	for _, prKey := range staged {
+		for _, h := range m.set.PRHashes[prKey] {
+			m.dec.Committed[h] = true
 		}
 	}
-	return m, nil
+	m.reconcileSkipped()
+	m.confirmCommit = false
+	m.status = fmt.Sprintf("committed %d PR(s)", len(staged))
+	m.refreshBody()
+	m.openLog("Commit log", logs)
 }
 
-// commitLogVisibleLines returns how many log lines fit inside the popup content area.
-func (m model) commitLogVisibleLines() int {
-	// popup uses most of the terminal height; subtract border (2), padding (2), title (2)
-	h := m.termHeight - 8
-	if h < 1 {
-		h = 1
-	}
-	return h
-}
-
-// viewCommitLog renders the scrollable commit log popup.
-func (m model) viewCommitLog() string {
-	visible := m.commitLogVisibleLines()
-
-	// clamp offset
-	offset := m.commitLogOffset
-	maxOff := len(m.commitLog) - visible
-	if maxOff < 0 {
-		maxOff = 0
-	}
-	if offset > maxOff {
-		offset = maxOff
-	}
-	if offset < 0 {
-		offset = 0
-	}
-
-	window := sliceForWindow(m.commitLog, offset, visible)
-
-	// scrollbar
-	sb := renderScrollbar(visible, len(m.commitLog), offset)
-	withScroll := appendScrollbar(window, sb, m.termWidth-10)
-
-	titleStyle := lipgloss.NewStyle().Bold(true)
-	title := titleStyle.Render(fmt.Sprintf("Commit log (%d/%d lines) — w/s: scroll • enter/q: close",
-		min(offset+visible, len(m.commitLog)), len(m.commitLog)))
-
-	panelWidth := m.termWidth - 4
-	if panelWidth < 40 {
-		panelWidth = 40
-	}
-	panelH := visible + 2
-	panel := lipgloss.NewStyle().
-		Width(panelWidth).
-		Height(panelH).
-		Border(lipgloss.NormalBorder()).
-		BorderForeground(lipgloss.Color("10")).
-		Padding(1).
-		Render(strings.Join(withScroll, "\n"))
-
-	return lipgloss.JoinVertical(lipgloss.Left, title, panel)
-}
-
-// viewConfirmation renders the confirmation dialog overlay.
-func (m model) viewConfirmation() string {
-	filtered := m.buildFilteredPrMap()
-	var prKeys []string
-	for k := range filtered {
-		prKeys = append(prKeys, k)
-	}
-	sort.Strings(prKeys)
-
-	var lines []string
-	lines = append(lines, lipgloss.NewStyle().Bold(true).Render("Confirm approval of the following PRs?"))
-	lines = append(lines, "")
-	for _, prKey := range prKeys {
-		lines = append(lines, fmt.Sprintf("  %s %s", approve.VerifiedIcon(m.verifiedMap[prKey]), shortenPRURL(prKey)))
+func (m *model) viewConfirmation() string {
+	lines := []string{titleStyle.Render("Confirm approval of the following PRs?"), ""}
+	for _, prKey := range m.stagedPRs() {
+		lines = append(lines, fmt.Sprintf("  %s %s", approve.VerifiedIcon(m.set.Verified[prKey]), shortenPRURL(prKey)))
 	}
 	lines = append(lines, "")
 	if m.settings.reviewComment != "" {
-		lines = append(lines, fmt.Sprintf("  Review comment: %s", m.settings.reviewComment))
-		lines = append(lines, "")
+		lines = append(lines, fmt.Sprintf("  Review comment: %s", m.settings.reviewComment), "")
 	}
-	lines = append(lines, lipgloss.NewStyle().Bold(true).Render("  Press 'y' to confirm, 'n' to cancel"))
-
-	content := strings.Join(lines, "\n")
-
-	dialogWidth := 60
-	if m.termWidth-10 > dialogWidth {
-		dialogWidth = min(m.termWidth-10, 100)
+	if m.dryRun {
+		lines = append(lines, dimStyle.Render("  dry-run: nothing will be submitted"), "")
 	}
-	dialogStyle := lipgloss.NewStyle().
-		Width(dialogWidth).
+	lines = append(lines, titleStyle.Render("  Press 'y' to confirm, 'n' to cancel"))
+
+	width := min(max(m.termWidth-10, 60), 100)
+	dialog := lipgloss.NewStyle().
+		Width(width).
 		Border(lipgloss.DoubleBorder()).
-		BorderForeground(lipgloss.Color("11")).
-		Padding(1, 2)
+		BorderForeground(focusBorder).
+		Padding(1, 2).
+		Render(strings.Join(lines, "\n"))
 
-	dialog := dialogStyle.Render(content)
 	return lipgloss.Place(m.termWidth, m.termHeight, lipgloss.Center, lipgloss.Center, dialog)
 }
 
-// --- Scrollbar rendering ---
+// --- Log popup ---
 
-// renderScrollbar generates a vertical scrollbar as a slice of strings (one per visible line).
-func renderScrollbar(visibleLines, totalLines, offset int) []string {
-	if totalLines <= visibleLines || visibleLines <= 0 {
-		result := make([]string, visibleLines)
-		for i := range result {
-			result[i] = " "
-		}
-		return result
+func (m *model) openLog(title string, lines []string) {
+	if len(lines) == 0 {
+		m.status = "nothing to show in " + strings.ToLower(title)
+		return
 	}
-	thumbSize := max(1, visibleLines*visibleLines/totalLines)
-	maxOffset := totalLines - visibleLines
-	thumbStart := 0
-	if maxOffset > 0 {
-		thumbStart = offset * (visibleLines - thumbSize) / maxOffset
-	}
-	if thumbStart < 0 {
-		thumbStart = 0
-	}
-	if thumbStart+thumbSize > visibleLines {
-		thumbStart = visibleLines - thumbSize
-	}
-
-	result := make([]string, visibleLines)
-	for i := range result {
-		if i >= thumbStart && i < thumbStart+thumbSize {
-			result[i] = "█"
-		} else {
-			result[i] = "░"
-		}
-	}
-	return result
+	m.logTitle = title
+	m.logLines = lines
+	m.logOffset = 0
+	m.showLog = true
 }
 
-// appendScrollbar joins each content line with the corresponding scrollbar glyph.
-// contentWidth is the column's usable content area (= columnWidth - padding).
-// Each line is truncated to (contentWidth-2) visible chars so that appending " █"
-// never exceeds the content area and wraps to the next terminal line.
-func appendScrollbar(contentLines []string, scrollbar []string, contentWidth int) []string {
-	maxLine := contentWidth - 2
-	if maxLine < 1 {
-		maxLine = 1
+func (m *model) logVisibleLines() int {
+	return max(m.termHeight-4, 1)
+}
+
+func (m *model) updateLog(k string) {
+	visible := m.logVisibleLines()
+	switch k {
+	case "enter", "q", "esc":
+		m.showLog = false
+	case "w", "up":
+		m.logOffset = clampOffset(m.logOffset-1, len(m.logLines), visible)
+	case "s", "down":
+		m.logOffset = clampOffset(m.logOffset+1, len(m.logLines), visible)
+	case "pgup":
+		m.logOffset = clampOffset(m.logOffset-visible, len(m.logLines), visible)
+	case "pgdown":
+		m.logOffset = clampOffset(m.logOffset+visible, len(m.logLines), visible)
 	}
-	result := make([]string, len(contentLines))
-	for i, line := range contentLines {
-		sb := " "
-		if i < len(scrollbar) {
-			sb = scrollbar[i]
+}
+
+func (m *model) viewLog() string {
+	visible := m.logVisibleLines()
+	offset := clampOffset(m.logOffset, len(m.logLines), visible)
+	width := max(m.termWidth-borderCells, 40)
+	textW := max(width-paddingCells-scrollbarCells, 10)
+
+	bar := scrollbar(visible, len(m.logLines), offset)
+	rows := make([]string, visible)
+	for i := range visible {
+		line := ""
+		if idx := offset + i; idx < len(m.logLines) {
+			line = m.logLines[idx]
 		}
-		truncated := lipgloss.NewStyle().MaxWidth(maxLine).Render(line)
-		result[i] = truncated + " " + sb
+		rows[i] = fit(line, textW) + " " + bar[i]
 	}
-	return result
+
+	panel := lipgloss.NewStyle().
+		Width(width).
+		Height(visible).
+		Border(lipgloss.NormalBorder()).
+		BorderForeground(lipgloss.Color("10")).
+		Padding(0, 1).
+		Render(strings.Join(rows, "\n"))
+
+	return lipgloss.JoinVertical(lipgloss.Left,
+		titleStyle.Render(fmt.Sprintf("%s (%d/%d lines) — w/s: scroll • enter/q: close",
+			m.logTitle, min(offset+visible, len(m.logLines)), len(m.logLines))),
+		panel)
 }
 
 // --- Context lines filtering ---
 
-// filterContextLines keeps only N context lines around each change (+/-) line,
-// inserting "..." gap markers where context is elided.
+// filterContextLines keeps only n context lines around each +/- line, inserting
+// "..." markers where context was elided.
 func filterContextLines(lines []string, n int) []string {
-	if n <= 0 || len(lines) == 0 {
-		// n==0 means show only +/- lines (no context)
+	if n <= 0 {
 		var result []string
 		for _, l := range lines {
 			if strings.HasPrefix(l, "+") || strings.HasPrefix(l, "-") {
@@ -1732,26 +985,27 @@ func filterContextLines(lines []string, n int) []string {
 		return result
 	}
 
-	// mark which lines to keep (change lines + N context around them)
 	keep := make([]bool, len(lines))
 	for i, l := range lines {
-		if strings.HasPrefix(l, "+") || strings.HasPrefix(l, "-") {
-			for j := max(0, i-n); j <= min(len(lines)-1, i+n); j++ {
-				keep[j] = true
-			}
+		if !strings.HasPrefix(l, "+") && !strings.HasPrefix(l, "-") {
+			continue
+		}
+		for j := max(0, i-n); j <= min(len(lines)-1, i+n); j++ {
+			keep[j] = true
 		}
 	}
 
 	var result []string
 	lastKept := -1
 	for i, l := range lines {
-		if keep[i] {
-			if lastKept >= 0 && i-lastKept > 1 {
-				result = append(result, "...")
-			}
-			result = append(result, l)
-			lastKept = i
+		if !keep[i] {
+			continue
 		}
+		if lastKept >= 0 && i-lastKept > 1 {
+			result = append(result, "...")
+		}
+		result = append(result, l)
+		lastKept = i
 	}
 	return result
 }
