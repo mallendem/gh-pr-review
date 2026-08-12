@@ -3,12 +3,11 @@ package gh
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -17,167 +16,159 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-func (g *GhClient) getPrHash(pr *github.PullRequest) ([]string, map[string][]string, map[string]string, map[string][]string, error) {
-	diffURL := pr.GetURL()
-	req, err := http.NewRequest("GET", diffURL, nil)
+// fetchDiff downloads the unified diff for a PR.
+func (g *GhClient) fetchDiff(pr *github.PullRequest) (string, error) {
+	req, err := http.NewRequest("GET", pr.GetURL(), nil)
 	if err != nil {
-		return nil, nil, nil, nil, err
+		return "", err
 	}
 	req.Header.Set("Accept", "application/vnd.github.diff")
 
 	resp, err := g.c.Client().Do(req)
 	if err != nil {
-		return nil, nil, nil, nil, err
+		return "", err
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	diffBytes, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, nil, nil, nil, err
+		return "", err
 	}
-	diff := string(diffBytes)
-
-	var hashes []string
-	var hunkLines []string
-	var rawHunkLines []string
-	inHunk := false
-	hunkMap := make(map[string][]string)
-	rawHunkMap := make(map[string][]string)
-	hashFileMap := make(map[string]string)
-	currentFile := ""
-
-	flushHunk := func() {
-		if len(hunkLines) == 0 {
-			return
-		}
-		hash := sha256.Sum256([]byte(strings.Join(hunkLines, "\n")))
-		h := hex.EncodeToString(hash[:])
-		hashes = append(hashes, h)
-		hunkMap[h] = append([]string(nil), hunkLines...)
-		rawHunkMap[h] = append([]string(nil), rawHunkLines...)
-		hashFileMap[h] = currentFile
-		hunkLines = nil
-		rawHunkLines = nil
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		// Without this check an error page would be parsed as a diff and
+		// silently yield zero hashes.
+		return "", fmt.Errorf("diff request for %s returned status %d: %s",
+			pr.GetHTMLURL(), resp.StatusCode, truncate(string(body), 200))
 	}
-
-	for _, line := range strings.Split(diff, "\n") {
-		if strings.HasPrefix(line, "diff --git ") {
-			flushHunk()
-			inHunk = false
-			if idx := strings.LastIndex(line, " b/"); idx >= 0 {
-				currentFile = line[idx+3:]
-			}
-			continue
-		}
-		if strings.HasPrefix(line, "@@") {
-			flushHunk()
-			inHunk = true
-			continue
-		}
-		if inHunk {
-			if strings.HasPrefix(line, "+++") || strings.HasPrefix(line, "---") {
-				continue
-			}
-			// Capture all lines (context, additions, deletions) into rawHunkLines
-			rawHunkLines = append(rawHunkLines, line)
-			if strings.HasPrefix(line, "+") || strings.HasPrefix(line, "-") {
-				hunkLines = append(hunkLines, normalizeHunkLine(line, currentFile))
-			}
-		}
-	}
-	flushHunk()
-
-	return hashes, hunkMap, hashFileMap, rawHunkMap, nil
+	return string(body), nil
 }
 
-func (g *GhClient) GetPrReviewRequested() (GhPrHashMap, HashChangeMap, HashPrMap, PrHashMap, PrVerifiedMap, HashFileMap, HashRawChangeMap, error) {
-	userHashPrMap := make(GhPrHashMap)
-	n, err := g.getNotifications()
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "…"
+}
+
+// GetPrReviewRequested fetches every open PR that requested your review and
+// groups their changes by content hash. A PR that cannot be fetched or parsed
+// is recorded in ReviewSet.Warnings rather than failing the whole run.
+func (g *GhClient) GetPrReviewRequested() (*ReviewSet, error) {
+	notifications, err := g.getNotifications()
 	if err != nil {
-		return nil, nil, nil, nil, nil, nil, nil, err
+		return nil, err
 	}
 
-	hashChangeMap := make(map[string][]string)
-	hashRawChangeMap := make(HashRawChangeMap)
-	hashPrMap := make(HashPrMap)
-	prHashMap := make(PrHashMap)
-	prVerifiedMap := make(PrVerifiedMap)
-	hashFileMap := make(HashFileMap)
-
-	mu := sync.Mutex{}
+	set := newReviewSet()
+	var mu sync.Mutex
 	eg := new(errgroup.Group)
 	eg.SetLimit(CONCURRENCY_LIMIT)
 
-	for _, notification := range n {
+	for _, notification := range notifications {
+		if notification.GetReason() != "review_requested" {
+			continue
+		}
 		eg.Go(func() error {
-			if notification.GetReason() != "review_requested" {
+			pr, err := g.pullRequestFor(notification)
+			if err != nil {
+				mu.Lock()
+				set.Warnings = append(set.Warnings, err.Error())
+				mu.Unlock()
 				return nil
 			}
-			url := notification.GetSubject().GetURL()
-			owner := notification.GetRepository().GetOwner().GetLogin()
-			repo := notification.GetRepository().GetName()
-			prNumber, err := strconv.Atoi(strings.Split(url, "/pulls/")[1])
-			if err != nil {
-				return fmt.Errorf("failed to parse PR number from %s: %w", url, err)
-			}
-			pr, _, err := g.c.PullRequests.Get(context.Background(), owner, repo, prNumber)
-			if err != nil {
-				return err
-			}
-			if pr == nil || pr.GetState() != "open" {
+			if pr == nil {
 				return nil
 			}
-			prUser := pr.GetUser().GetLogin()
 
-			prHash, localChangeMap, localFileMap, localRawChangeMap, err := g.getPrHash(pr)
+			diff, err := g.fetchDiff(pr)
 			if err != nil {
-				return err
+				mu.Lock()
+				set.Warnings = append(set.Warnings, err.Error())
+				mu.Unlock()
+				return nil
 			}
-
-			verified := g.areCommitsVerified(owner, repo, pr.GetNumber())
+			blocks := parseDiff(diff)
+			verified := g.areCommitsVerified(pr)
 
 			mu.Lock()
-			if userHashPrMap[prUser] == nil {
-				userHashPrMap[prUser] = make(map[string][]*github.PullRequest)
-			}
-			prKey := pr.GetHTMLURL()
-			prVerifiedMap[prKey] = verified
-			for _, h := range prHash {
-				if !containsPR(userHashPrMap[prUser][h], prKey) {
-					userHashPrMap[prUser][h] = append(userHashPrMap[prUser][h], pr)
-				}
-				if !containsPR(hashPrMap[h], prKey) {
-					hashPrMap[h] = append(hashPrMap[h], pr)
-				}
-				if !containsString(prHashMap[prKey], h) {
-					prHashMap[prKey] = append(prHashMap[prKey], h)
-				}
-			}
-			for k, v := range localChangeMap {
-				if _, ok := hashChangeMap[k]; !ok {
-					hashChangeMap[k] = v
-				}
-			}
-			for h, file := range localFileMap {
-				if hashFileMap[h] == nil {
-					hashFileMap[h] = make(map[string]string)
-				}
-				hashFileMap[h][prKey] = file
-			}
-			for k, v := range localRawChangeMap {
-				if _, ok := hashRawChangeMap[k]; !ok {
-					hashRawChangeMap[k] = v
-				}
-			}
+			set.add(pr, blocks, verified)
 			mu.Unlock()
 			return nil
 		})
 	}
 
 	if err := eg.Wait(); err != nil {
-		return nil, nil, nil, nil, nil, nil, nil, err
+		return nil, err
 	}
-	return userHashPrMap, hashChangeMap, hashPrMap, prHashMap, prVerifiedMap, hashFileMap, hashRawChangeMap, nil
+	set.sortOccurrences()
+	return set, nil
+}
+
+// pullRequestFor resolves the open PR a notification refers to. It returns
+// (nil, nil) when the PR exists but is not open.
+func (g *GhClient) pullRequestFor(n *github.Notification) (*github.PullRequest, error) {
+	url := n.GetSubject().GetURL()
+	_, numPart, ok := strings.Cut(url, "/pulls/")
+	if !ok {
+		return nil, fmt.Errorf("notification subject %q is not a pull request", url)
+	}
+	number, err := strconv.Atoi(numPart)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse PR number from %s: %w", url, err)
+	}
+	owner := n.GetRepository().GetOwner().GetLogin()
+	repo := n.GetRepository().GetName()
+	pr, _, err := g.c.PullRequests.Get(context.Background(), owner, repo, number)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch %s/%s#%d: %w", owner, repo, number, err)
+	}
+	if pr == nil || pr.GetState() != "open" {
+		return nil, nil
+	}
+	return pr, nil
+}
+
+// add records one PR's change blocks. Callers must hold the set's lock.
+func (r *ReviewSet) add(pr *github.PullRequest, blocks []diffBlock, verified bool) {
+	prKey := pr.GetHTMLURL()
+	author := pr.GetUser().GetLogin()
+	if r.UsersToHashes[author] == nil {
+		r.UsersToHashes[author] = make(map[string][]*github.PullRequest)
+	}
+	r.Verified[prKey] = verified
+
+	for _, b := range blocks {
+		if !containsPR(r.UsersToHashes[author][b.hash], prKey) {
+			r.UsersToHashes[author][b.hash] = append(r.UsersToHashes[author][b.hash], pr)
+		}
+		if !containsPR(r.HashPRs[b.hash], prKey) {
+			r.HashPRs[b.hash] = append(r.HashPRs[b.hash], pr)
+		}
+		if !containsString(r.PRHashes[prKey], b.hash) {
+			r.PRHashes[prKey] = append(r.PRHashes[prKey], b.hash)
+		}
+		if _, ok := r.Changes[b.hash]; !ok {
+			r.Changes[b.hash] = b.lines
+		}
+		r.Occurrences[b.hash] = append(r.Occurrences[b.hash], Occurrence{
+			PrURL: prKey,
+			File:  b.file,
+			Raw:   b.raw,
+		})
+	}
+}
+
+// sortOccurrences gives each hash a stable presentation order, since PRs are
+// fetched concurrently.
+func (r *ReviewSet) sortOccurrences() {
+	for _, occs := range r.Occurrences {
+		sort.SliceStable(occs, func(i, j int) bool {
+			if occs[i].File != occs[j].File {
+				return occs[i].File < occs[j].File
+			}
+			return occs[i].PrURL < occs[j].PrURL
+		})
+	}
 }
 
 func containsPR(prs []*github.PullRequest, url string) bool {
@@ -198,84 +189,102 @@ func containsString(ss []string, s string) bool {
 	return false
 }
 
-// areCommitsVerified checks whether all commits in a PR are verified (signed).
-func (g *GhClient) areCommitsVerified(owner, repo string, number int) bool {
-	commits, _, err := g.c.PullRequests.ListCommits(context.Background(), owner, repo, number, nil)
-	if err != nil {
+// areCommitsVerified reports whether every commit in a PR is signed.
+func (g *GhClient) areCommitsVerified(pr *github.PullRequest) bool {
+	base := pr.GetBase()
+	owner := base.GetRepo().GetOwner().GetLogin()
+	repo := base.GetRepo().GetName()
+	if owner == "" || repo == "" {
 		return false
 	}
-	for _, c := range commits {
-		if c.GetCommit().GetVerification().GetVerified() != true {
+
+	opt := &github.ListOptions{PerPage: 100}
+	total := 0
+	for {
+		commits, resp, err := g.c.PullRequests.ListCommits(context.Background(), owner, repo, pr.GetNumber(), opt)
+		if err != nil {
 			return false
 		}
+		for _, c := range commits {
+			if !c.GetCommit().GetVerification().GetVerified() {
+				return false
+			}
+		}
+		total += len(commits)
+		if resp == nil || resp.NextPage == 0 {
+			break
+		}
+		opt.Page = resp.NextPage
 	}
-	return len(commits) > 0
+	return total > 0
 }
 
-func (g *GhClient) ApprovePr(pr *github.PullRequest, reviewBody string) error {
+// ApprovePr updates the PR's branch if needed, approves it and enables
+// auto-merge. It returns progress lines for the caller to display: the GUI owns
+// the terminal, so nothing here may write to stdout.
+func (g *GhClient) ApprovePr(pr *github.PullRequest, reviewBody string) ([]string, error) {
 	if pr == nil {
-		return fmt.Errorf("nil PR")
+		return nil, fmt.Errorf("nil PR")
 	}
 
 	base := pr.GetBase()
 	if base == nil || base.GetRepo() == nil || base.GetRepo().GetOwner() == nil {
-		return fmt.Errorf("unable to determine owner/repo for PR %s", pr.GetHTMLURL())
+		return nil, fmt.Errorf("unable to determine owner/repo for PR %s", pr.GetHTMLURL())
 	}
 	owner := base.GetRepo().GetOwner().GetLogin()
 	repo := base.GetRepo().GetName()
 	number := pr.GetNumber()
+	var logs []string
+	logf := func(format string, args ...any) {
+		logs = append(logs, fmt.Sprintf(format, args...))
+	}
 
-	// 1) Try to update the branch (rebase) using the REST endpoint
-	// Only attempt to update the branch if the head is behind the base branch.
+	// 1) Rebase the branch, but only if it is actually behind the base.
 	baseRef := base.GetRef()
 	headRef := pr.GetHead().GetRef()
-	if baseRef == "" || headRef == "" {
-		fmt.Printf("warning: unable to determine refs for PR %s, skipping update-branch\n", pr.GetHTMLURL())
-	} else {
+	switch {
+	case baseRef == "" || headRef == "":
+		logf("warning: unable to determine refs for PR %s, skipping update-branch", pr.GetHTMLURL())
+	default:
 		behind, err := g.isBranchBehind(owner, repo, baseRef, headRef)
-		if err != nil {
-			fmt.Printf("warning: failed to check branch status for PR %s: %v\n", pr.GetHTMLURL(), err)
-		} else if behind {
+		switch {
+		case err != nil:
+			logf("warning: failed to check branch status for PR %s: %v", pr.GetHTMLURL(), err)
+		case behind:
 			if err := g.tryUpdateBranch(owner, repo, number); err != nil {
-				// TODO: this doesn't work, no idea why rebasing via API is so broken,
-				// but we should detect if we _need_ to rebase first before trying, and
-				// if it fails, we should return errors properly.
-				fmt.Printf("warning: failed to update branch for PR %s: %v\n", pr.GetHTMLURL(), err)
-				//return err
+				logf("warning: failed to update branch for PR %s: %v", pr.GetHTMLURL(), err)
 			}
-		} else {
-			fmt.Printf("branch for PR %s is up-to-date with base (%s), skipping update-branch\n", pr.GetHTMLURL(), baseRef)
+		default:
+			logf("branch for PR %s is up-to-date with base (%s), skipping update-branch", pr.GetHTMLURL(), baseRef)
 		}
 	}
 
-	// 2) Approve the PR (create a review with APPROVE)
+	// 2) Approve the PR.
 	approveEvent := "APPROVE"
-	review := &github.PullRequestReviewRequest{
-		Event: &approveEvent,
-	}
+	review := &github.PullRequestReviewRequest{Event: &approveEvent}
 	if reviewBody != "" {
 		review.Body = &reviewBody
 	}
-	_, _, revErr := g.c.PullRequests.CreateReview(context.Background(), owner, repo, number, review)
-	if revErr != nil {
-		return fmt.Errorf("failed to create approval for PR %s: %w", pr.GetHTMLURL(), revErr)
+	if _, _, err := g.c.PullRequests.CreateReview(context.Background(), owner, repo, number, review); err != nil {
+		return logs, fmt.Errorf("failed to create approval for PR %s: %w", pr.GetHTMLURL(), err)
 	}
 
-	// 3) Enable auto-merge for the PR using GraphQL mutation
-	// Use the enablePullRequestAutoMerge mutation (requires PR node ID)
+	// 3) Enable auto-merge, falling back to an immediate squash merge.
 	nodeID := pr.GetNodeID()
 	if nodeID == "" {
-		return fmt.Errorf("PR %s has no node ID, cant enable auto-merge", pr.GetHTMLURL())
-	} else {
-		if err := g.tryEnableAutoMerge(nodeID, pr); err != nil {
-			fmt.Printf("warning: enabling auto-merge failed for PR %s: %v; attempting squash merge\n", pr.GetHTMLURL(), err)
-			if mergeErr := g.trySquashMerge(owner, repo, number, pr); mergeErr != nil {
-				return fmt.Errorf("squash merge failed for PR %s: %v; original auto-merge error: %w", pr.GetHTMLURL(), mergeErr, err)
-			}
+		return logs, fmt.Errorf("PR %s has no node ID, cant enable auto-merge", pr.GetHTMLURL())
+	}
+	if err := g.tryEnableAutoMerge(nodeID, pr); err != nil {
+		logf("warning: enabling auto-merge failed for PR %s: %v; attempting squash merge", pr.GetHTMLURL(), err)
+		if mergeErr := g.trySquashMerge(owner, repo, number, pr); mergeErr != nil {
+			return logs, fmt.Errorf("squash merge failed for PR %s: %v; original auto-merge error: %w", pr.GetHTMLURL(), mergeErr, err)
 		}
+		logf("squash merged PR %s", pr.GetHTMLURL())
+	} else {
+		logf("enabled auto-merge (GraphQL) for PR %s", pr.GetHTMLURL())
 	}
 
-	return nil
+	return logs, nil
 }
 
 // tryEnableAutoMerge attempts to enable auto-merge for the given PR using GraphQL.
@@ -284,13 +293,12 @@ func (g *GhClient) ApprovePr(pr *github.PullRequest, reviewBody string) error {
 func (g *GhClient) tryEnableAutoMerge(nodeID string, pr *github.PullRequest) error {
 	graphqlURL := "https://api.github.com/graphql"
 	mutation := `mutation EnableAutoMerge($pullId:ID!, $mergeMethod:PullRequestMergeMethod!) { enablePullRequestAutoMerge(input:{pullRequestId:$pullId, mergeMethod:$mergeMethod}) { pullRequest { id } } }`
-	vars := map[string]any{
-		"pullId":      nodeID,
-		"mergeMethod": "SQUASH",
-	}
 	payload := map[string]any{
-		"query":     mutation,
-		"variables": vars,
+		"query": mutation,
+		"variables": map[string]any{
+			"pullId":      nodeID,
+			"mergeMethod": "SQUASH",
+		},
 	}
 	bodyBytes, _ := json.Marshal(payload)
 	reqGQL, err := http.NewRequest("POST", graphqlURL, bytes.NewReader(bodyBytes))
@@ -309,125 +317,107 @@ func (g *GhClient) tryEnableAutoMerge(nodeID string, pr *github.PullRequest) err
 	if respGQL.StatusCode < 200 || respGQL.StatusCode > 299 {
 		return fmt.Errorf("GraphQL enablePullRequestAutoMerge returned status %d for PR %s: %s", respGQL.StatusCode, pr.GetHTMLURL(), string(body))
 	}
-	// inspect response for GraphQL errors
 	var gqlResp struct {
 		Data   any              `json:"data"`
 		Errors []map[string]any `json:"errors"`
 	}
 	if err := json.Unmarshal(body, &gqlResp); err != nil {
 		return fmt.Errorf("failed to decode GraphQL response for PR %s: %w", pr.GetHTMLURL(), err)
-	} else if len(gqlResp.Errors) > 0 {
+	}
+	if len(gqlResp.Errors) > 0 {
 		return fmt.Errorf("GraphQL returned errors for PR %s: %v", pr.GetHTMLURL(), gqlResp.Errors)
 	}
-	fmt.Printf("enabled auto-merge (GraphQL) for PR %s\n", pr.GetHTMLURL())
 	return nil
 }
 
-func (g *GhClient) GetPrComment(pr *github.PullRequest) (string, error) {
+// trySquashMerge attempts to immediately squash-merge the given PR.
+func (g *GhClient) trySquashMerge(owner, repo string, number int, pr *github.PullRequest) error {
+	commitMessage := fmt.Sprintf("Squash merge PR #%d: %s", number, pr.GetTitle())
+	opt := &github.PullRequestOptions{MergeMethod: "squash"}
+	if _, _, err := g.c.PullRequests.Merge(context.Background(), owner, repo, number, commitMessage, opt); err != nil {
+		return fmt.Errorf("merge failed for PR %s: %w", pr.GetHTMLURL(), err)
+	}
+	return nil
+}
+
+// PrBody returns the PR description with Dependabot's command footer stripped.
+func PrBody(pr *github.PullRequest) (string, error) {
 	if pr == nil {
 		return "", fmt.Errorf("nil PR")
 	}
-
-	// Prefer the PR description/body if it's present
 	if body := strings.TrimSpace(pr.GetBody()); body != "" {
 		return cleanDependabotMessage(body), nil
 	}
-	// No comment found
 	return "", fmt.Errorf("no comment/body found for PR %s", pr.GetHTMLURL())
 }
 
 func (g *GhClient) PrintChangesPerUser(users []string) {
-	userHashPrMap, hashChangeMap, _, prHashMap, _, _, _, err := g.GetPrReviewRequested()
+	set, err := g.GetPrReviewRequested()
 	if err != nil {
 		fmt.Printf("Error fetching PR review requests: %v\n", err)
 		return
 	}
+	for _, w := range set.Warnings {
+		fmt.Printf("warning: %s\n", w)
+	}
 
 	// normalize and dedupe requested users into a lookup map (lowercase)
 	filter := map[string]struct{}{}
-	if len(users) > 0 {
-		for _, u := range users {
-			// cobra's StringSlice may allow comma-separated entries; split further if needed
-			for _, token := range strings.Split(u, ",") {
-				n := strings.TrimSpace(token)
-				if n == "" {
-					continue
-				}
+	for _, u := range users {
+		// cobra's StringSlice may allow comma-separated entries; split further if needed
+		for _, token := range strings.Split(u, ",") {
+			if n := strings.TrimSpace(token); n != "" {
 				filter[strings.ToLower(n)] = struct{}{}
 			}
 		}
 	}
 
-	for user, hashMap := range userHashPrMap {
-		lowerUser := strings.ToLower(user)
-		// if filter provided, skip users not in the filter
+	for _, user := range set.Users() {
 		if len(filter) > 0 {
-			if _, ok := filter[lowerUser]; !ok {
+			if _, ok := filter[strings.ToLower(user)]; !ok {
 				continue
 			}
 		}
 
 		fmt.Printf("User: %s\n", user)
-		for hash, prs := range hashMap {
+		for hash, prs := range set.UsersToHashes[user] {
 			fmt.Printf("  Hash: %s\n", hash)
-			if changes, ok := hashChangeMap[hash]; ok {
-				fmt.Println("    Changes:")
-				for _, line := range changes {
-					fmt.Printf("      %s\n", line)
-				}
-			} else {
-				fmt.Println("    No changes found for this hash.")
-			}
+			printChanges(set.Changes[hash], "    ")
 
 			// For each PR tied to this hash, show additional hashes associated with that PR
 			for _, pr := range prs {
-				prKey := pr.GetHTMLURL()
-				if linked, ok := prHashMap[prKey]; ok {
-					var extras []string
-					for _, ah := range linked {
-						if ah == hash {
-							continue
-						}
-						extras = append(extras, ah)
-					}
-					if len(extras) > 0 {
-						fmt.Printf("    Additional hashes linked in PR %s:\n", prKey)
-						for _, ah := range extras {
-							fmt.Printf("      %s\n", ah)
-							if changes2, ok2 := hashChangeMap[ah]; ok2 {
-								fmt.Println("        Changes:")
-								for _, line := range changes2 {
-									fmt.Printf("          %s\n", line)
-								}
-							} else {
-								fmt.Println("        No changes found for this hash.")
-							}
-						}
-					}
+				extras := otherHashes(set.PRHashes[pr.GetHTMLURL()], hash)
+				if len(extras) == 0 {
+					continue
+				}
+				fmt.Printf("    Additional hashes linked in PR %s:\n", pr.GetHTMLURL())
+				for _, ah := range extras {
+					fmt.Printf("      %s\n", ah)
+					printChanges(set.Changes[ah], "        ")
 				}
 			}
 		}
 	}
 }
 
-// trySquashMerge attempts to immediately squash-merge the given PR.
-// Returns nil on success or an error describing the failure.
-func (g *GhClient) trySquashMerge(owner, repo string, number int, pr *github.PullRequest) error {
-	commitMessage := fmt.Sprintf("Squash merge PR #%d: %s", number, pr.GetTitle())
-	opt := &github.PullRequestOptions{
-		MergeMethod: "squash",
-		CommitTitle: "",
+func printChanges(changes []string, indent string) {
+	if len(changes) == 0 {
+		fmt.Printf("%sNo changes found for this hash.\n", indent)
+		return
 	}
-	_, _, err := g.c.PullRequests.Merge(
-		context.Background(),
-		owner,
-		repo,
-		number,
-		commitMessage,
-		opt)
+	fmt.Printf("%sChanges:\n", indent)
+	for _, line := range changes {
+		fmt.Printf("%s  %s\n", indent, line)
+	}
+}
 
-	if err != nil {
-		return fmt.Errorf("merge failed for PR %s: %w", pr.GetHTMLURL(), err)
+// otherHashes returns every hash in the list except the given one.
+func otherHashes(hashes []string, except string) []string {
+	var extras []string
+	for _, h := range hashes {
+		if h != except {
+			extras = append(extras, h)
+		}
 	}
-	return nil
+	return extras
 }
