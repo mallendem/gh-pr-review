@@ -57,24 +57,46 @@ func parseDiff(diff string) []diffBlock {
 
 // splitHunk turns a single hunk's lines into one block per run of +/- lines.
 func splitHunk(hunk []string, file string) []diffBlock {
-	var blocks []diffBlock
+	// Locate every run first, so a block's context can stop short of its
+	// neighbours. Letting it run on made the changes pane show a neighbouring
+	// bump as if the selected hash covered it too.
+	type span struct{ start, end int } // end is exclusive
+	var spans []span
 	for i := 0; i < len(hunk); {
 		if !isChangeLine(hunk[i]) {
 			i++
 			continue
 		}
 		start := i
-		var lines []string
 		for i < len(hunk) && isChangeLine(hunk[i]) {
-			lines = append(lines, normalizeHunkLine(hunk[i], file))
 			i++
 		}
+		spans = append(spans, span{start, i})
+	}
+
+	blocks := make([]diffBlock, 0, len(spans))
+	for n, s := range spans {
+		lines := make([]string, 0, s.end-s.start)
+		for _, line := range hunk[s.start:s.end] {
+			lines = append(lines, normalizeHunkLine(line, file))
+		}
+
+		// Context between two blocks belongs to both of them.
+		from := max(s.start-maxStoredContext, 0)
+		if n > 0 {
+			from = max(from, spans[n-1].end)
+		}
+		to := min(s.end+maxStoredContext, len(hunk))
+		if n+1 < len(spans) {
+			to = min(to, spans[n+1].start)
+		}
+
 		sum := sha256.Sum256([]byte(strings.Join(lines, "\n")))
 		blocks = append(blocks, diffBlock{
 			hash:  hex.EncodeToString(sum[:]),
 			file:  file,
 			lines: lines,
-			raw:   hunk[max(0, start-maxStoredContext):min(len(hunk), i+maxStoredContext)],
+			raw:   hunk[from:to],
 		})
 	}
 	return blocks
